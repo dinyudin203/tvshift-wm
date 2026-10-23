@@ -1,0 +1,354 @@
+================================================================================
+ tvshift 실험용 세 모델 구현 설명 : WAM-IDM / ICWM / Reflective VLA
+ 작성 2026-10-04
+================================================================================
+
+공통 실험 세팅 (tvshift)
+------------------------
+  카메라 각도 x task 를 한 쌍씩만 학습한다. 각 task 는 정확히 한 각도에서만 본다.
+
+      training angle   suite     LIBERO task idx   instruction
+      0°               Spatial   1, 3              black bowl next to ramekin / on cookie box -> plate
+      45°              Goal      0, 7              open middle drawer / turn on stove
+      270°             Object    0, 1              alphabet soup / cream cheese -> basket
+      345°             Goal      2, 5              wine bottle on cabinet / push plate to front of stove
+
+  (task idx 는 LIBERO 벤치마크 레지스트리 순서. 패킹된 LeRobot 데이터의 내부
+   알파벳 순서와 다르다.)
+
+  데이터 위치
+      WAM-IDM : /workspace/yujin/data/lingbot_va_tvshift/encoded   (VAE latent 로 미리 인코딩)
+      ICWM    : /workspace/yujin/data/libero_tvshift/lerobot_v30/
+                  libero_spatial_theta000 / libero_goal_theta045 /
+                  libero_goal_theta345 / libero_object_theta270   (LeRobot v3.0, 데이터셋마다 2 task)
+                (같은 폴더에 theta015, theta330 도 있으나 학습에는 쓰지 않는다)
+
+  평가 프로토콜
+      seen pair  : 각 task 를 학습한 각도에서 평가                     (8 조합)
+      novel pair : 각 task 를 학습하지 않은 나머지 3개 학습 각도에서 평가 (24 조합)
+                   -> task 도 각도도 학습에서 봤지만 그 "짝"은 본 적 없음
+      (unseen angle 프로토콜은 이번 실행에서 하지 않는다)
+
+
+================================================================================
+1. WAM-IDM  (lingbot-va, dual-stream MoT, idm 레이아웃)
+================================================================================
+
+1.1 한 줄 요약
+  LingBot-VA(arXiv 2601.21998) 의 video+action 자기회귀 world-action 모델을,
+  공개 코드의 "한 세트 블록 공유" 구조 대신 논문 §3.3 대로 두 스트림 Mixture-of-
+  Transformers 로 다시 구현한 것. Wan2.2-TI2V-5B 에서만 출발한다(로봇 사전학습 없음).
+
+1.2 모델  (wan_va/modules/model_mot.py, 클래스 WanMoTTransformer3DModel)
+  - video expert : 30 블록, d_v=3072, ffn 14336  (4.910B)
+  - action expert: 30 블록, d_a= 768, ffn  3584  (0.733B)      총 5.741B, bf16
+  - 두 expert 모두 24 head x 128 dim 이라 q/k/v 가 같은 3072 폭 attention 공간에 산다.
+    매 레이어에서 두 expert 의 q/k/v 를 이어 붙여 flex attention 을 한 번 돌리고, 결과를
+    다시 잘라 각 expert 가 자기 to_out / 텍스트 cross-attn / FFN 을 적용한다.
+    action expert 의 QKV(768->3072) 가 논문의 "video 차원으로 올리는 linear" 에 해당.
+  - 논문은 "+약 350M, 총 5.3B" 라고 하는데 실측 5.741B. 차이 약 380M 은 action expert 의
+    텍스트 cross-attn k/v. 논문에 명시가 없어 공개판/Fast-WAM 을 따라 남겼다.
+
+1.3 attention 레이아웃 'idm'  (chunk 단위 block id)
+  video chunk k -> block id 2k,  그 chunk 의 action -> 2k+1
+      clean -> clean   : block_id(kv) <= block_id(q)   (causal)
+      noised -> clean  : block_id(kv) <  block_id(q)
+      noised -> noised : block_id(kv) == block_id(q)
+  결과: noised action 은 같은 chunk 의 clean video 를 본다 (= inverse dynamics).
+        noised video 는 같은 chunk 의 action 을 못 본다.
+        noised video 와 noised action 은 서로 못 본다.
+  (대조군 'joint' 는 둘 다 block id k 로 두어 noised 끼리 서로 보게 한다. 이번엔 쓰지 않음.)
+  clean video 문맥에는 확률 0.5 로 noise augmentation (s ~ U[0.5,1.0]).
+
+1.4 초기화  (tools/mot/build_mot_init.py)
+  Wan2.2 -> shared 체크포인트(wan22-lingbot-init) -> MoT.
+  video expert 는 shared 블록을 그대로 복사, action expert 는 같은 블록을 action shape 로
+  1D linear 보간 (align_corners=True) 하고 alpha=sqrt(3072/768)=2.0 을 곱한다.
+  copied=1126, interpolated=524, missing=0.
+  결과 /workspace/yujin/checkpoints/wan22-lingbot-mot-init  (vae/tokenizer/text_encoder 는
+  lingbot-va-base 로 심링크).
+
+1.5 학습  (config: libero_tvshift_mot_idm,  launcher: script/run_libero_tvshift_mot.sh)
+  - 8 GPU, FSDP2 (블록 단위 샤딩 + 자체 gradient checkpoint), bf16
+  - AdamW lr 1e-5, betas (0.9,0.95), wd 0.1, warmup 10 후 constant, grad clip 2.0
+  - 5000 step, per-GPU batch 4 x 8 GPU x accum 1 = effective 32
+  - 매 step chunk_size ~ randint(1,5), window_size ~ randint(4,65)
+  - cfg_prob 0.1 (텍스트를 empty embedding 으로 교체)
+  - video loss 1.0, action loss 1.0, video snr_shift 5.0, action snr_shift 0.05
+  - action 채널 7개(0..6) 사용, 분위수 정규화. norm_stat 은 va_libero_cfg 기본값을 그대로
+    썼다 (기존 tvshift 실행들과 비교 가능하게 하려고 3-suite 혼합으로 재계산하지 않음).
+  - 체크포인트 500 step 마다. 가중치 외에 training_state.pt(Adam moment + step)도 저장하므로
+    LINGBOT_VA_AUTO_RESUME=1 로 재시작하면 같은 궤적으로 이어진다.
+  - 한 체크포인트 약 54GB (training_state 포함).
+
+1.6 평가  (이번에 새로 연결)
+  - wan_va/configs/va_libero_tvshift_mot_i2va.py : 추론 config libero_tvshift_mot_idm_i2av
+  - tools/tvshift_mot_eval.py : 32 조합을 GPU 별 큐로 돌린다 (조합당 evaluation/libero/
+    launch_mot_eval.sh 한 번 = 서버(5.7B) + 클라이언트).
+  - 카메라 회전은 client.py 가 lingbot-va-adapt 의 apply_camera_condition 으로 적용
+    (agentview 방위각, pivot 이 world 원점이라 실효 각도는 이름 붙은 각도의 대략 절반).
+  - hilo2 (4 x A6000) 에서 episode 10개/조합. episode 하나가 약 13분 (smoke 1회 측정).
+  - 드라이버 /workspace/yujin/run_tvshift_eval_hilo2.sh : 학습 종료 감지 -> 체크포인트 전송
+    -> hilo2 에서 분리 실행 -> summary.json 이 생기면 결과 회수.
+
+1.7 알려둘 점
+  - step 500 체크포인트로 hilo2 smoke 1 episode 는 파이프라인상 정상 종료 (0/1, 미학습 상태라 정상).
+  - 조합당 10 episode 는 통계가 거칠다 (조합 하나의 95% CI 가 매우 넓다). 프로토콜
+    (seen 80 / novel 240 episode) 단위로 합산해서 봐야 의미가 있다.
+
+
+================================================================================
+2. ICWM  (In-Context World Modeling for Robotic Control, arXiv 2606.26025)
+================================================================================
+
+2.1 한 줄 요약
+  Qwen2.5-VL-3B-Instruct 를 backbone 으로, 행동 예측 전에 "환경과 상호작용한 짧은 클립
+  N 개"(시작 관측, 행동, 끝 관측)를 같은 시퀀스 앞에 붙여 backbone 이 카메라/동역학
+  같은 잠재 요인을 in-context 로 추론하게 만든 정책. 행동은 FAST 토큰으로 이산화해
+  next-token cross-entropy 로 학습한다.
+
+2.2 구현 위치  (/workspace/yujin/icwm/lerobot, LeRobot 체크아웃 복사본에 policy 추가)
+  src/lerobot/policies/icwm/
+    configuration_icwm.py : ICWMConfig. backbone=Qwen/Qwen2.5-VL-3B-Instruct,
+                            n_context_clips=5, action_chunk_size=5, FAST tokenizer 설정,
+                            AdamW wd 1e-4, lr 5e-5, warmup+cosine.
+    modeling_icwm.py      : ICWMPolicy. MoE 가 아닌 dense Qwen2_5_VLForConditionalGeneration 을
+                            로드하고 token embedding 을 resize 해서 <|action_token_i|> 를 추가.
+                            forward() = 타깃 행동 토큰 위치에만 걸린 masked cross-entropy.
+                            predict_action_chunk() = model.generate() 로 FAST 토큰을
+                            자기회귀 디코드 -> 연속 행동으로 복원.
+    processor_icwm.py     : ICWMSequenceBuilderStep. 논문 Fig.2 의 시퀀스를 만든다.
+        [o^s_1, a_1, o^e_1] ... [o^s_N, a_N, o^e_N] [o_t, l]  ->  [a_t]
+        Qwen chat template 으로 직렬화. labels 는 타깃 a_t 토큰 위치만 살리고
+        (나머지 -100) 컨텍스트 클립의 행동 토큰, 이미지, 지시문은 loss 에서 제외 (논문 Eq.7).
+  src/lerobot/datasets/icwm_context_sampler.py
+    ICWMInteractionSegmentPool : 여러 데이터셋(= 여러 시점)의 모든 궤적에서 상호작용
+                                 구간을 모아 pool 로 만든다 (에피소드 경계 존중).
+    ICWMContextSampledDataset  : 쿼리 (o_t,l,a_t) 데이터셋을 감싸서 __getitem__ 마다 pool 에서
+                                 N 개 클립을 새로 뽑아 붙인다. 클립은 쿼리와 같은 궤적/시점일
+                                 필요가 없다 -- 이 다양성이 backbone 이 컨텍스트를 실제로
+                                 쓰게 만든다.
+  scripts/train_icwm_libero_tvshift_8gpu.sh  (이번에 spatial 용 스크립트를 복사해 수정)
+
+2.3 이번 tvshift 학습 설정
+  - 시작 가중치 Qwen/Qwen2.5-VL-3B-Instruct, FAST tokenizer lerobot/fast-action-tokenizer
+    (실제 vocab 2048)
+  - 컨텍스트 pool = 4개 학습 데이터셋(spatial 0°, goal 45°, goal 345°, object 270°)
+  - accelerate 8 GPU, bf16, per-GPU batch 2, gradient checkpointing
+  - lr 5e-5, wd 1e-4, warmup 1000 (논문은 50000 이지만 데이터/스텝 규모에 맞춰 줄임),
+    cosine decay 는 총 step 에 맞춤. 총 20000 step (임의로 정한 값, STEPS 환경변수로 변경)
+  - 500 step 마다 저장, --resume=true. 중단 시 resume_icwm_libero_tvshift_8gpu.sh
+  - wandb project icwm-tvshift
+  - run_icwm_train.py 가 cuDNN 을 끈다: 이 머신의 드라이버(535, CUDA 12.2)와 torch 2.5.1+cu121
+    번들 cuDNN 9.2.0 조합이 Qwen2.5-VL 비전 패치 임베드 conv3d 에서
+    CUDNN_STATUS_NOT_INITIALIZED 를 낸다.
+
+2.4 논문과 다른 점 / 미구현
+  - 백본 연결 패턴은 wall_x(MoE) 가 아닌 eo1(dense) 을 따랐고, flow-matching head 는 빼고
+    FAST 토큰 cross-entropy 로 대체했다 (구조적으로 pi0_fast 와 비슷하나 백본이 Qwen).
+  - 행동 토큰은 Qwen vocab 에 새 special token 으로 추가 (pi0_fast 는 PaliGemma 의 미사용
+    꼬리 id 를 재사용하지만 Qwen 은 그런 블록이 없음).
+  - 컨텍스트 T 의 KV cache 재사용(논문 §6.4)은 미구현: 추론 시 매 호출마다 T 를 다시 인코딩.
+  - Active Probing(무작위 reach 로 컨텍스트 수집)은 정책 밖의 일이라 구현하지 않았다.
+    컨텍스트 클립은 이미 수집된 것을 ICWM_CONTEXT_* 관측 키로 넣는다.
+  - EXP 베이스라인(MV + oracle azimuth 텍스트)은 스텁만 있다.
+
+2.5 상태 (사실 관계)
+  - /workspace/yujin/icwm/README.md 는 9/2 시점에 작성돼 "학습을 돌리지 않았다"고 적혀 있지만
+    그 후 spatial 설정으로 실제 학습이 돌았다 (logs/train_spatial_*.log, 체크포인트
+    outputs/train/icwm_libero_spatial_table3/checkpoints/{002000,004000}). README 는 낡았다.
+  - tvshift 설정(이번 스크립트)은 아직 한 번도 실행하지 않았다. WAM-IDM 종료 후
+    run_tvshift_pipeline.sh 가 자동으로 시작한다.
+  - 이번 tvshift ICWM 의 평가 경로(위 seen/novel 프로토콜)는 아직 만들지 않았다.
+
+
+================================================================================
+3. Reflective VLA  (arXiv 2606.25215, Lian, Yu, Zhang)   /workspace/yujin/reflectiveVLA
+================================================================================
+
+3.1 한 줄 요약
+  VLA 가 "현재 관측 하나"만으로 행동을 정하면 카메라 외부 파라미터, 로봇 보정, 구동 편향
+  같은 embodiment 요인을 식별할 수 없다. K-1 개의 완료된 (관측, 행동, 결과) triplet
+  과 현재 관측에 조건화해서 이 요인을 in-context 로 추론하게 한 VLA. 핵심 신호는
+  행동 실행 "결과" O'_i = O_{i+C} 이다 (논문 ablation: O only 72.3, O,A 73.8,
+  O,A,O' 77.8, reactive 73.1).
+  논문 코드는 공개되지 않아 논문 본문만 보고 처음부터 구현했다.
+
+3.2 구조  (LeRobot policy plugin, pi0.5 Mixture-of-Transformers 위)
+  - PaliGemma-3B prefix + 행동 expert(hidden 1024, flow matching), 모든 layer 에서 attention 공유.
+  - 모든 관측(3인칭, 손목, proprio)을 VLM 토큰 시퀀스 하나로 보낸다. proprio 와 과거 행동 chunk 는
+    2-layer MLP projector 로 토큰 공간에 사영(과거 행동 chunk 는 8 토큰, g_A).
+  - 토큰 레이아웃 (논문 부록 A.3), triplet 마다 반복:
+      <frame_start> 3rd_i wrist_i proprio_i <action_start> A_i <action_end>
+      3rd'_{i+C} wrist'_{i+C} proprio'_{i+C} <frame_end> <frame_sep>
+    지시문은 triplet 마다 다시 삽입하고 시간 인덱스 tau_i 를 포함. 마지막 블록은 관측만.
+  - 학습되는 frame-boundary 토큰 5종(sep/start/action_start/action_end/end). 논문
+    Limitations 가 "경계 토큰 + stride 무작위화"를 shortcut 완화책으로 명시하므로 장식이 아님.
+  - 구현 파일 src/reflective_vla/
+      masking.py        토큰 레이아웃, block-causal mask, RoPE 위치
+      tokenization.py   g_A / proprio / tau / boundary projector, prefix 조립
+      configuration_reflective_vla.py   논문 하이퍼파라미터, Table 4 preset
+      modeling_reflective_vla.py        ReflectiveVLAPytorch + ReflectiveVLAPolicy
+      buffer.py         추론용 FIFO triplet buffer
+      processor_reflective_vla.py       pre/post-processing
+
+3.3 block-causal mask (논문 Eq.6)
+  target frame t_k 의 query slot 이 보는 것:
+      V_{t_k} = { T_{t_j} : j<k }  U  { (L, tau_{t_k}, O_{t_k}) }
+  마스킹되는 것: 자기 자신의 실행 행동 A_{t_k} (정답 유출), 자기 결과 O'_{t_k} (미래 유출),
+  이후 모든 triplet, 형제 query slot.
+  효과: K 개 프레임을 한 번의 forward 로 전부 supervise (계단 패턴).
+      L_train = sum_k L_act(A_{t_k}; V_{t_k})   (flow-matching loss)
+  tests/test_model_leakage.py 와 test_masking.py 가 누출 없음을 검증한다.
+
+3.4 추론
+  완료된 triplet 의 rolling FIFO buffer. chunk 실행 후 새 triplet 을 append, 가득 차면
+  가장 오래된 것을 evict. 과거 triplet 의 VLM 쪽 KV 는 한 번만 인코딩해 캐시 재사용
+  (cached 경로와 joint forward 의 동등성 확인됨). 논문 보고: K=8 이 K=1 대비 프롬프트 8배인데
+  latency 는 1.43배.
+
+3.5 기본값(논문 재현용)
+  K=8, C=10, PaliGemma-3B, 행동 expert hidden 1024, triplet 별 지시문 재삽입, 학습형 경계 토큰,
+  전체 fine-tuning 에 VLM lr 0.1x. context_frames=1 이면 논문의 matched reactive baseline,
+  context_mode 로 O / OA / OAO ablation 선택.
+  논문 LIBERO 학습 설정: peak lr 1e-4(expert/projector), VLM 0.1x, AdamW (0.9,0.95), wd 0.01,
+  grad clip 1.0, bf16, batch 4/GPU, reflective 50k step. 학습 시 인접 context frame 간격은
+  C + U[0,15] env step (고정 stride shortcut 방지), 평가 시엔 gap=0 고정 stride.
+  VLM 은 초기에 frozen 후 linear warm-up + cosine decay.
+
+3.6 tvshift 학습용으로 이번에 추가한 것 (2026-10-04)
+  구현 (reflectiveVLA/ 아래)
+    src/reflective_vla/data/build_cache.py   tvshift LeRobot v3.0 4개 데이터셋(512x512 mp4)을
+        224x224 uint8 memmap 으로 한 번만 디코드 (프레임 50,313개, 카메라 2개, 약 15GB,
+        /workspace/yujin/data/reflective_tvshift_cache). 에피소드 길이와 디코드 프레임 수를 assert.
+    src/reflective_vla/data/triplet_dataset.py   M4. 질의 시점 t 에서 뒤로 K-1 개 프레임을
+        t_{k-1} = t_k - (C + g), g ~ U[0,15] 로 뽑는다 (평가 모드는 g=0).
+        프레임 k 의 관측 O_k, 실행 chunk A_k = action[t_k:t_k+C] (그대로 타깃도 됨),
+        결과 O'_k = O_{t_k + C}. 에피소드 시작 앞쪽으로 넘치는 프레임은 frame_mask=False
+        (이미지 0, 타깃 아님). state/action 은 분위수(q01,q99) 정규화, action 은 delta EEF 그대로.
+        카메라 2개: observation.images.image / wrist_image, state 8차원, action 7차원.
+    scripts/train_tvshift.py   M5. torchrun + FSDP2(루트 한 그룹), fp32 샤딩 마스터 + bf16 연산,
+        fp32 gradient reduce. 전체 파라미터를 한 그룹으로 샤딩한 이유: pi0.5 코드가 디코더 층
+        가중치를 layer.forward 가 아니라 직접 꺼내 쓰므로 층별 FSDP 훅이 안 걸린다.
+        AdamW(betas 0.9/0.95, wd 0.01), 파라미터 그룹 2개 (expert/projector lr 1e-4, VLM 0.1x),
+        초반 warmup 구간 동안 VLM lr=0 (논문의 "초기 VLM frozen"), cosine decay 는 최종 0.1x.
+        grad clip 1.0. gradient accumulation. 500 step 마다 분산 체크포인트(DCP: 모델+optimizer
+        +step)를 ckpt/last 에, 추론용 bf16 safetensors 를 export/step_N 에 저장(최신 2개 유지).
+        재시작하면 ckpt/last 에서 자동으로 이어한다.
+    scripts/run_tvshift.sh     런처 (기본 K=8, 5000 step, GPU당 배치 1 x accum 4 x 8 GPU = effective 32)
+    /workspace/yujin/run_reflective_after_icwm.sh   ICWM 20000 step 체크포인트가 생기면 시작,
+        죽으면 최대 20번 재시작. supervisord 에도 등록.
+  초기화: lerobot/pi05_base (/workspace/yujin/checkpoints/pi05_base). 새 모듈(triplet projector,
+        경계 토큰 등)은 랜덤 초기화, 나머지는 pi0.5 가중치. PaliGemma 토크나이저는 gated 라
+        /workspace/yujin/checkpoints/paligemma_tokenizer 에 로컬 복사본을 두고 쓴다.
+  기존 코드에서 고친 버그 2개
+    1) masking.build_position_ids 의 정수 einsum 이 CUDA 에서 지원되지 않음
+       ("baddbmm_cuda not implemented for 'Long'"). 기존 테스트는 CPU 라 못 잡았다. float 로 계산 후 변환.
+    2) 손실 mse_loss(u_t fp32, v_t bf16) 의 dtype 불일치로 backward 실패. 둘 다 fp32 로 맞춤.
+       (FSDP bf16 연산에서 fp32 입력이 Linear/Conv 로 들어가는 곳은 입력 dtype 캐스트 훅으로 처리.)
+  학습에 gradient 가 안 가는 파라미터 (LM head 2개, VLM 마지막 층의 o_proj/MLP/post-attn norm,
+  최종 norm) 는 requires_grad=False 로 고정. 그대로 두면 optimizer 상태가 안 생겨서
+  체크포인트에서 이어하기가 "Missing key" 로 실패한다.
+
+3.7 검증한 것 / 못 한 것
+  검증 (hilo2 4 x A6000, K=8 배치 1)
+    - 기존 단위 테스트 37개 통과 (이번에 직접 실행. 이 서버 CPU 에서).
+    - 데이터셋: 샘플 shape, 마스킹, 평가 모드에서 "결과 이미지 == 다음 프레임 관측" 확인.
+    - 학습 forward/backward/optimizer step 동작, 저장(DCP+export) 후 이어하기(step 4 -> 6) 동작.
+    - export safetensors 826 키, 키 이름이 model.* 로 PI05 로더와 맞는다. bf16.
+  못 한 것
+    - 8 GPU 실전 설정 그대로의 실행. 이 서버의 8 GPU 는 WAM-IDM/ICWM 이 쓰고 있어서 4 GPU 에서만 돌렸다.
+      (8 GPU 면 샤딩이 더 촘촘해서 메모리는 더 여유롭다.)
+    - 학습이 수렴하는지 / loss 가 잘 내려가는지는 아직 모른다. 6 step 짜리만 돌렸다.
+  속도 (4 GPU, 배치 1 마이크로배치, K=8, 이미지 토큰 256개/장)
+      약 10~11초 / 마이크로배치.  8 GPU x accum 4 로 step 당 약 42초 예상.
+      5000 step 이면 약 2.4일.  (20000 step 이면 약 10일이라 5000 으로 정함)
+      참고: 이미지 토큰을 4배 풀링(--image-token-pool 4)하면 약 2배, K=4 로 줄여도 약 2배 빨라진다.
+      기본은 풀링 없음(논문 설정)으로 둔다.
+  메모리: 4 GPU 에서 배치 1 최대 약 35GB. 배치 2 는 4 GPU 에서 OOM.
+
+3.8 평가 경로 (M6, 2026-10-04 추가)
+  파일
+    src/reflective_vla/eval/env_worker.py   LIBERO 시뮬레이터 서버 (robosuite+LIBERO 파이썬에서 실행)
+    scripts/eval_tvshift.py                 정책 쪽 + 오케스트레이터 (seen 8 + novel 24 조합)
+    /workspace/yujin/run_reflective_eval_hilo2.sh   학습 종료 감지 -> 체크포인트 전송 -> hilo2 에서
+                                                    평가 -> 결과 회수 (supervisord 등록, 재개 가능)
+  구조: 정책(torch 2.9, lerobot)과 시뮬레이터(robosuite 1.4)는 한 환경에 못 넣어서 프로세스를 나누고
+        로컬 소켓(multiprocessing.connection)으로 주고받는다. GPU 마다 정책 프로세스 하나가 모델을
+        한 번 로드하고, 자기 몫의 조합을 돌면서 시뮬레이터 서브프로세스를 쓴다. 끝난 조합은 건너뛴다.
+  학습 데이터와 맞춘 것
+    - 관측: 512x512 렌더 -> 상하 반전 -> INTER_AREA 로 224 (학습 캐시를 만든 방식 그대로).
+      이미지 방향은 학습 프레임과 평가 렌더를 눈으로 비교해 같음을 확인.
+    - state 8차원 = [eef_pos(3), 쿼터니언->axis-angle(3), gripper_qpos(2)]. 평가 환경의 초기 state 를
+      학습 데이터 첫 프레임과 비교해 형식이 같음을 확인 (pos ~(-0.2, 0, 1.17), 회전 ~(3.14, 0, -0.1)).
+    - 카메라 회전: 학습 데이터를 만든 render_shard.py 의 rotated_camera_pose 와 평가에 쓰는
+      apply_camera_condition 이 45/270/345 도 모두 소수점 16자리까지 같은 카메라 pose 를 낸다.
+      (WAM-IDM 평가도 같은 함수를 쓰므로 세 모델의 각도 정의가 일치한다.)
+    - 정규화: 학습 때 저장한 stats.json (분위수) 으로 state 정규화, action 역정규화.
+    - 실행: chunk C=10 을 열린 루프로 전부 실행한 뒤 다시 추론. triplet 의 결과 관측은 그 다음 추론
+      시점의 관측과 정확히 일치한다 (학습의 gap=0 과 동일). 그리퍼는 +-1 로 이진화. 호라이즌 800 step.
+  WAM-IDM 클라이언트와 다른 점 (의도적)
+    - 시작 대기 5 step 을 WAM-IDM 은 전부 0 action 으로 하는데, 0 그리퍼 명령은 손가락을 반쯤 닫는다
+      (gripper qpos 0.021, 학습 데이터는 0.036). state 를 입력받는 Reflective 에는 분포 밖 입력이라
+      대기 동안 그리퍼를 열린 상태(-1)로 둔다. 이 때문에 두 모델의 시작 조건이 아주 조금 다르다.
+  검증한 것: pi0.5 초기 가중치(학습 안 된 모델)로 hilo2 에서 1 episode 를 끝까지 돌렸다 (실패는 정상).
+    정책 추론 + 시뮬레이터 + 롤아웃 배관이 동작하고, 실패 episode(800 step) 하나가 약 6.5분 걸렸다.
+  검증 못 한 것: 학습된 export(model.safetensors)를 이 평가 경로로 불러오는 부분. 키 이름이
+    policy.state_dict 와 같다는 것(826 키, model.* 접두사)만 확인했고 실제 로드는 학습 뒤 처음 일어난다.
+    성공률이 의미 있는지(학습이 되었는지)도 물론 아직 모른다.
+  시간 추정: 조합당 10 episode, 4 GPU -> GPU 당 80 episode. 성공이 많으면 수 시간, 전부 실패하면
+    약 9시간 (실패 episode 6.5분 기준).
+
+
+================================================================================
+4. ICWM 변경 기록 (2026-10-05~06)
+================================================================================
+  (a) 질의 데이터셋: 처음 구현은 --dataset.repo_id 로 넘긴 spatial 0도 하나(11,754 프레임)만 질의로 썼고
+      나머지 3개는 클립 풀로만 쓰였다. 로그의 dataset.num_frames=11754 로 확인. 지금은 4개 합집합
+      (50,313 프레임, 393 에피소드, 8 task) 을 질의로 쓴다. (ICWMViewpointMatchedDataset)
+  (b) 컨텍스트 클립 샘플링: 질의와 같은 시점(= 같은 데이터셋) 풀에서만 뽑고, 질의 자신의 에피소드는 제외한다.
+      논문 4.1절은 "모든 시점의 풀에서 무작위"라고만 쓰여 있으나, 논문 ablation(180도 어긋난 클립이 컨텍스트
+      없음보다 나쁨)은 모델이 맞는 시점의 클립을 쓴다는 뜻이라 시점 매칭으로 해석했다. 확정은 아님.
+      --policy.context_match_viewpoint=true 로 켠다 (기본 false = 이전 방식).
+  (c) 속도: 프로파일링(torch.profiler, rank0, 4 step)으로 본 병목.
+      - 수정 전: step 12.6초. GPU 가 실제 일한 시간은 step 당 1.4초(약 11%).
+        preprocess(Qwen processor 앞단의 clamp/mul/round) 가 6.2초: 코어 31개에 프로세스 8개가 각자
+        스레드를 코어 수만큼 띄워서 연산 하나가 호출당 60ms (이미지 한 장 clamp+mul+round: 31스레드 127ms,
+        2스레드 3.3ms). load average 96.
+      - 영상 캐시(build_icwm_cache.py, 79GB, 512x512 원본 해상도 그대로, 픽셀 차이 0 확인)만으로는
+        data_wait 이 6초 -> 0.05초로 줄었지만 step 시간은 그대로였다. 병목이 전처리의 스레드 과다 구독이었기 때문.
+      - OMP_NUM_THREADS=2 로 제한한 뒤: step 5.9초 (2.1배), data_s 0.4초, GPU 사용률 50~100%.
+      - 남은 병목(추정): 비전 패치 임베딩 Conv3d 가 cuDNN 비활성 때문에 느린 커널(slow_conv_dilated3d,
+        GPU 시간의 약 60%), 커널 launch 오버헤드, 8 GPU DDP 동기화. 아직 안 고쳤다.
+  (d) 로깅(wandb): lerobot 기본 지표(loss, grad_norm, lr, update_s, dataloading_s, samples, epochs)에 더해
+      data_wait_s / preprocess_s (데이터 시간 분해), system/gpu_mem_*, token_acc / exact_chunk_acc /
+      target_tokens_per_chunk / seq_len (teacher forcing 진단) 을 같은 run (tnyn8ht2) 에 기록한다.
+  (e) 평가: icwm/lerobot/run_icwm_eval_tvshift.py (active probing 20회 -> 클립 5개 무작위 -> 추론),
+      hilo2 에서 실행, run_icwm_eval_hilo2.sh 가 학습 종료 후 자동 실행.
+  (f) FAST 디코딩이 깨지는 이유: 행동 chunk(5x7)를 DCT -> 정수 양자화 -> BPE 로 토큰화하므로 디코딩은
+      BPE 복원 문자열이 정확히 35개(5x7)여야 성공한다. 토큰 하나가 틀리면 BPE 병합 때문에 길이가 달라지거나
+      DCT 계수 여러 개가 바뀌어(계수 하나가 5 step 전체에 영향) 궤적이 틀어진다. 길이가 안 맞으면
+      디코더는 0 계수로 대체하므로, 정규화 해제 후 평균 행동이 5 step 반복 실행된다.
+
+================================================================================
+5. ICWM + Reflective-VLA 식 컨텍스트 (icwm_libero_tvshift_hist, 2026-10-19)
+================================================================================
+  목적: ICWM 구조(Qwen2.5-VL-3B, FAST, 클립 5개)는 그대로 두고, 컨텍스트 클립의 출처만
+        Reflective VLA 처럼 "같은 episode 에서 직전에 실행한 chunk" 로 바꾼다.
+  학습  --policy.context_source=history (기본값 pool = 기존 ICWM)
+        질의 프레임 t 기준으로 클립 5개를 거꾸로 뽑는다. 클립 k 는 (o_s, a[s:s+5], o_{s+5}),
+        s_k = s_{k+1} - (5 + g), g ~ U[0,15] (Reflective 의 stride 무작위화), 오래된 것부터 순서대로.
+        episode 시작 이전으로 넘어가는 클립은 blank (검은 이미지, action 0, gripper -1).
+        나머지 설정은 v2 와 동일 (4 데이터셋 질의 합집합, 20000 step, batch 16, lr 5e-5).
+        구현: datasets/icwm_context_sampler.py (ICWMInteractionSegmentPool.history / clip_at),
+        configuration_icwm.py (context_source, context_history_max_gap), factory.py.
+  평가  run_icwm_eval_tvshift.py --history-context
+        probing 없음. 매 chunk 를 뽑을 때 이 episode 에서 실행한 직전 chunk 5개
+        (chunk 직전 관측, 실행한 action 5개, chunk 직후 관측) 를 컨텍스트로 쓰고, 모자라면 앞을 blank 로 채움.
+        gap 은 0 (실행 chunk 가 연속).
+  Reflective VLA 와 다른 점: 클립 수 5 (Reflective K-1=7), chunk 길이 5 (Reflective C=10),
+        클립 이미지는 agentview 만 (Reflective 는 wrist, proprio 포함), action 은 FAST 토큰.
+  드라이버 /workspace/yujin/run_icwm_hist.sh (학습 -> hilo2 로 체크포인트 전송 -> 평가 -> 결과 회수)
+        결과 icwm/evaluate_results/hist_step20000
+  검증: gap 0 에서 최신 클립 끝 프레임 = 질의 프레임, 클립끼리 연속, action 이 데이터셋과 일치
+        (실데이터 확인). hilo2 에서 평가 1 episode 를 끝까지 돌림 (v2 체크포인트로 경로만 확인).

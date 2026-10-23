@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+outputs/
+evaluate_results/
+wandb/
+logs/
+*.log
+*.safetensors
+*.npy
+*.npz
+.venv*/
+conda_env*/
