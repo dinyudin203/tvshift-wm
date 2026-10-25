@@ -191,7 +191,7 @@ def _maybe_wrap_icwm_context_sampler(cfg: TrainPipelineConfig, dataset):
                     tolerance_s=cfg.tolerance_s,
                 )
             )
-        pool_datasets = [LeRobotDataset(root, root=root) for root in roots]
+        pool_datasets = [LeRobotDataset(root, root=root, video_backend=cfg.dataset.video_backend) for root in roots]
         logging.info("ICWM viewpoint-matched training: %d viewpoint datasets, %d query frames",
                      len(roots), sum(len(d) for d in query_datasets))
         return ICWMViewpointMatchedDataset(
@@ -202,8 +202,11 @@ def _maybe_wrap_icwm_context_sampler(cfg: TrainPipelineConfig, dataset):
             stride=policy_cfg.context_pool_stride,
             context_source=getattr(policy_cfg, "context_source", "pool"),
             history_max_gap=getattr(policy_cfg, "context_history_max_gap", 15),
+            explore_dir=getattr(policy_cfg, "context_explore_dir", ""),
+            n_history_clips=getattr(policy_cfg, "n_history_clips", 0),
+            history_dropout=getattr(policy_cfg, "history_dropout", 0.0),
             probe_dir=getattr(policy_cfg, "context_probe_dir", None),
-            n_history_clips=getattr(policy_cfg, "context_mixed_n_history", 5),
+            n_mixed_history=getattr(policy_cfg, "context_mixed_n_history", 5),
             drop_history_p=getattr(policy_cfg, "context_drop_history_p", 0.0),
             drop_explore_p=getattr(policy_cfg, "context_drop_explore_p", 0.0),
         )

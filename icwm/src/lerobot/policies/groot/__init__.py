@@ -15,7 +15,11 @@
 # limitations under the License.
 
 from .configuration_groot import GrootConfig
-from .modeling_groot import GrootPolicy
-from .processor_groot import make_groot_pre_post_processors
+
+try:  # groot_n1's @strict config fails under huggingface_hub>=1.x; only GrootPolicy users need it (not ICWM)
+    from .modeling_groot import GrootPolicy
+    from .processor_groot import make_groot_pre_post_processors
+except Exception:  # noqa: BLE001
+    GrootPolicy = make_groot_pre_post_processors = None
 
 __all__ = ["GrootConfig", "GrootPolicy", "make_groot_pre_post_processors"]

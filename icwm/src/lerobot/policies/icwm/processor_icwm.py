@@ -53,6 +53,7 @@ from lerobot.processor import (
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.types import TransitionKey
 from lerobot.utils.constants import (
+    ACTION,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -79,9 +80,8 @@ ICWM_CONTEXT_ACTIONS = "observation.icwm_context.actions"  # (N, action_chunk_si
 # optional (B,) int: only the LAST n_valid of the N clips are real; the leading N - n_valid are
 # placeholders (stacking needs a fixed N) and are left out of the sequence entirely
 ICWM_CONTEXT_N_VALID = "observation.icwm_context.n_valid"
-# context_source="mixed": a second segment of history clips (same layout and n_valid convention).
-# When these keys are present, each non-empty segment is preceded by a text marker
-# ("Exploration:" / "History:") so the model can tell the two sources apart.
+# optional second context segment, the query's own recent history (same clip format and n_valid
+# convention). When present the two segments are tagged "Exploration:" / "History:" in the prompt.
 ICWM_HISTORY_OBS_START = "observation.icwm_history.images_start"
 ICWM_HISTORY_OBS_END = "observation.icwm_history.images_end"
 ICWM_HISTORY_ACTIONS = "observation.icwm_history.actions"
@@ -116,6 +116,10 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
     image_max_pixels: int | None = 128 * 28 * 28
     use_fast_processor: bool = False
     input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]] = field(default_factory=dict)
+    # context_source="mixed" prompt: "Exploration:" / "History:" only before non-empty segments, and "Task:"
+    # before the query. False: both tags whenever a history segment is present, no "Task:" (n_history_clips).
+    # Not in the processor json of mixed checkpoints saved before this field existed: the eval sets it from the config.
+    mixed_markers: bool = False
 
     _processor: "Qwen2_5_VLProcessor | None" = field(default=None, init=False, repr=False)
     _fast_tokenizer: Any = field(default=None, init=False, repr=False)
@@ -181,12 +185,20 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
         action = self.transition.get(TransitionKey.ACTION)  # None at pure-inference time
 
         bsize = len(tasks)
-        ctx_obs_start = observation.get(ICWM_CONTEXT_OBS_START)
-        ctx_obs_end = observation.get(ICWM_CONTEXT_OBS_END)
-        ctx_actions = observation.get(ICWM_CONTEXT_ACTIONS)
-        n_clips = 0 if ctx_actions is None else ctx_actions.shape[1]
-        n_valid = observation.get(ICWM_CONTEXT_N_VALID)
-        n_valid = [n_clips] * bsize if n_valid is None else [int(v) for v in n_valid.reshape(-1).tolist()]
+        # one entry per context segment: (tag, starts, ends, actions, n_clips, n_valid per row)
+        segments = []
+        for tag, k_start, k_end, k_act, k_nv in (
+            ("Exploration:", ICWM_CONTEXT_OBS_START, ICWM_CONTEXT_OBS_END, ICWM_CONTEXT_ACTIONS, ICWM_CONTEXT_N_VALID),
+            ("History:", ICWM_HISTORY_OBS_START, ICWM_HISTORY_OBS_END, ICWM_HISTORY_ACTIONS, ICWM_HISTORY_N_VALID),
+        ):
+            acts = observation.get(k_act)
+            if acts is None:
+                continue
+            n = acts.shape[1]
+            nv = observation.get(k_nv)
+            nv = [n] * bsize if nv is None else [int(v) for v in nv.reshape(-1).tolist()]
+            segments.append([tag, observation[k_start], observation[k_end], acts, n, nv])
+        tagged = any(seg[0] == "History:" for seg in segments)  # untagged: the original single-segment prompt
 
         # NOTE: by the time this step runs, `accelerate`'s `DataLoader` wrapper (via
         # `accelerator.prepare(dataloader)` in lerobot_train.py) may have already moved batch
@@ -200,22 +212,8 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
             for key in self._image_keys
             if key in observation
         }
-        if ctx_obs_start is not None:
-            ctx_obs_start = ctx_obs_start.detach().cpu()
-        if ctx_obs_end is not None:
-            ctx_obs_end = ctx_obs_end.detach().cpu()
-        if ctx_actions is not None:
-            ctx_actions = ctx_actions.detach().cpu()
-        hist_actions = observation.get(ICWM_HISTORY_ACTIONS)
-        mixed = hist_actions is not None
-        segments = [(ctx_obs_start, ctx_obs_end, ctx_actions, n_clips, n_valid, "Exploration:")]
-        if mixed:
-            hist_n = hist_actions.shape[1]
-            hist_valid = observation.get(ICWM_HISTORY_N_VALID)
-            hist_valid = [hist_n] * bsize if hist_valid is None else [int(v) for v in hist_valid.reshape(-1).tolist()]
-            segments.append((observation[ICWM_HISTORY_OBS_START].detach().cpu(),
-                             observation[ICWM_HISTORY_OBS_END].detach().cpu(),
-                             hist_actions.detach().cpu(), hist_n, hist_valid, "History:"))
+        for seg in segments:
+            seg[1:4] = [t.detach().cpu() for t in seg[1:4]]
         if action is not None:
             action = action.detach().cpu()
 
@@ -224,20 +222,20 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
         for b in range(bsize):
             content: list[dict[str, Any]] = []
             # --- N interaction clips: [o^s_i tokens, a_i FAST tokens, o^e_i tokens] ---
-            for seg_start, seg_end, seg_actions, seg_n, seg_valid, marker in segments:
-                if mixed and seg_valid[b] > 0:
-                    content.append({"type": "text", "text": marker})
-                for i in range(seg_n - seg_valid[b], seg_n):
-                    start_img = seg_start[b, i].clamp(0, 1).mul(255.0).round().to(torch.uint8)
-                    end_img = seg_end[b, i].clamp(0, 1).mul(255.0).round().to(torch.uint8)
-                    action_text, _ = self._encode_action_chunk(seg_actions[b, i])
+            for tag, starts, ends, acts, n_clips, n_valid in segments:
+                if tagged and (not self.mixed_markers or n_valid[b] > 0):
+                    content.append({"type": "text", "text": tag})
+                for i in range(n_clips - n_valid[b], n_clips):
+                    start_img = starts[b, i].clamp(0, 1).mul(255.0).round().to(torch.uint8)
+                    end_img = ends[b, i].clamp(0, 1).mul(255.0).round().to(torch.uint8)
+                    action_text, _ = self._encode_action_chunk(acts[b, i])
                     content.append({"type": "image", "image": start_img})
                     content.append({"type": "text", "text": action_text})
                     content.append({"type": "image", "image": end_img})
-            if mixed:
-                content.append({"type": "text", "text": "Task:"})
 
             # --- Task query: current observation o_t + instruction l ---
+            if tagged and self.mixed_markers:
+                content.append({"type": "text", "text": "Task:"})
             for key in self._image_keys:
                 if key in images_uint8:
                     content.append({"type": "image", "image": images_uint8[key][b]})
@@ -325,6 +323,7 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
             "image_min_pixels": self.image_min_pixels,
             "image_max_pixels": self.image_max_pixels,
             "use_fast_processor": self.use_fast_processor,
+            "mixed_markers": self.mixed_markers,
             "input_features": {
                 key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.input_features.items()
             },
@@ -346,6 +345,23 @@ def make_icwm_pre_post_processors(
 ]:
     """Build pre/post processor pipelines for ICWM."""
 
+    context_norm_steps: list[ProcessorStep] = []
+    ctx_action_keys = [k for k, n in ((ICWM_CONTEXT_ACTIONS, config.n_context_clips),
+                                      (ICWM_HISTORY_ACTIONS, config.context_mixed_n_history
+                                       if config.context_source == "mixed" else config.n_history_clips)) if n > 0]
+    if config.normalize_context_actions and ctx_action_keys:
+        # Context actions ride in the observation, where the normalizer skips ACTION-typed keys, so they are
+        # registered as a STATE-typed feature carrying the ACTION norm mode and the target action's stats.
+        context_norm_steps.append(
+            NormalizerProcessorStep(
+                features={k: PolicyFeature(type=FeatureType.STATE, shape=config.output_features[ACTION].shape)
+                          for k in ctx_action_keys},
+                norm_map={FeatureType.STATE: config.normalization_mapping["ACTION"]},
+                stats=None if dataset_stats is None else {k: dataset_stats[ACTION] for k in ctx_action_keys},
+                normalize_observation_keys=set(ctx_action_keys),
+            )
+        )
+
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
@@ -354,6 +370,7 @@ def make_icwm_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
+        *context_norm_steps,
         ICWMSequenceBuilderStep(
             backbone_name_or_path=config.backbone_name_or_path,
             fast_tokenizer_name_or_path=config.fast_tokenizer_name_or_path,
@@ -363,6 +380,7 @@ def make_icwm_pre_post_processors(
             image_max_pixels=config.image_max_pixels,
             use_fast_processor=config.use_fast_processor,
             input_features=config.input_features,
+            mixed_markers=config.context_source == "mixed",
         ),
         DeviceProcessorStep(device=config.device),
     ]

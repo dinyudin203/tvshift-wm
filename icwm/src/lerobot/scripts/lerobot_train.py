@@ -65,6 +65,37 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+class _CollateThenPreprocess:
+    """DataLoader collate that also runs the CPU part of the policy preprocessor (normalize + Qwen
+    processor + FAST) inside the worker processes, so it overlaps with the GPU step instead of
+    blocking the main process. The trailing DeviceProcessorStep is dropped: the accelerate-prepared
+    DataLoader already moves the batch to the device. Opt in with ICWM_PREP_IN_WORKERS=1."""
+
+    def __init__(self, base_collate, preprocessor, camera_keys):
+        import copy
+
+        from lerobot.processor import DeviceProcessorStep
+
+        self.base_collate = base_collate or torch.utils.data.default_collate
+        self.camera_keys = list(camera_keys)
+        self.pipeline = copy.deepcopy(preprocessor)
+        steps = list(self.pipeline.steps)
+        if not isinstance(steps[-1], DeviceProcessorStep) or steps[-1].float_dtype is not None:
+            raise ValueError("ICWM_PREP_IN_WORKERS expects the preprocessor to end in a plain DeviceProcessorStep")
+        for step in steps[:-1]:
+            if hasattr(step, "to"):
+                step.to(device="cpu")
+        self.pipeline.steps = steps[:-1]
+
+    def __call__(self, samples):
+        batch = self.base_collate(samples)
+        for cam_key in self.camera_keys:
+            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        with torch.no_grad():
+            return self.pipeline(batch)
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -461,6 +492,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    prep_in_workers = bool(os.environ.get("ICWM_PREP_IN_WORKERS")) and cfg.num_workers > 0
+    if prep_in_workers:
+        collate_fn = _CollateThenPreprocess(collate_fn, preprocessor, dataset.meta.camera_keys)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -546,12 +580,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         with record_function("data_wait"):
             batch = next(dl_iter)
         t_wait = time.perf_counter() - start_time
-        for cam_key in dataset.meta.camera_keys:
-            if cam_key in batch and batch[cam_key].dtype == torch.uint8:
-                batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
         t_pre0 = time.perf_counter()
-        with record_function("preprocess"):
-            batch = preprocessor(batch)
+        if not prep_in_workers:  # otherwise the DataLoader workers already did this
+            for cam_key in dataset.meta.camera_keys:
+                if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                    batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+            with record_function("preprocess"):
+                batch = preprocessor(batch)
         t_pre = time.perf_counter() - t_pre0
         train_tracker.dataloading_s = time.perf_counter() - start_time
         train_tracker.data_wait_s = t_wait

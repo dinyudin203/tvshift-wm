@@ -36,11 +36,13 @@ causally, over the N interaction-clip tokens". Concretely this policy:
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from lerobot.utils.constants import ACTION
@@ -129,7 +131,13 @@ class ICWMPolicy(PreTrainedPolicy):
             # runs one attention call per window (~12k tiny kernels per training step, launch-bound);
             # FlashAttention-2 does all windows of a layer in one variable-length call. Same exact
             # attention, different kernel; only the vision tower is switched, the LM keeps its kernel.
-            self.model.set_attn_implementation({"vision_config": "flash_attention_2"})
+            # "1" -> the flash_attn package; any other value is passed through as the implementation
+            # name, e.g. "kernels-community/flash-attn2" (prebuilt Hub kernel, no flash_attn build needed).
+            impl = os.environ["ICWM_VISION_FLASH_ATTN"]
+            if impl == "1":
+                self.model.set_attn_implementation({"vision_config": "flash_attention_2"})
+            else:  # the dict form rejects Hub kernel names; set it on the vision tower directly
+                self.model.model.visual.set_attn_implementation(impl)
             logging.info("ICWM: vision encoder attention -> flash_attention_2 (LM unchanged: %s)",
                          self.model.config.text_config._attn_implementation)
 
@@ -165,6 +173,11 @@ class ICWMPolicy(PreTrainedPolicy):
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            # ICWM_GC_SKIP_LAYERS=N: keep the activations of the first N language-model decoder layers instead of
+            # recomputing them (same math, trades spare VRAM for speed)
+            n_skip = int(os.environ.get("ICWM_GC_SKIP_LAYERS", "0"))
+            for layer in self.model.model.language_model.layers[:n_skip]:
+                layer.gradient_checkpointing = False
 
         self.model.to(config.device)
         self.reset()
@@ -186,6 +199,8 @@ class ICWMPolicy(PreTrainedPolicy):
         is passed, and -100 positions (context clips, images, instruction) contribute zero
         loss, exactly matching the paper's masking.
         """
+        if os.environ.get("ICWM_SPARSE_LOGITS") == "1":
+            return self._forward_sparse_logits(batch)
         # Logits only from the position before the first supervised token to the end: the full
         # (B, L, vocab) fp32 logits of a long in-context sequence (10 clips: L ~ 2.6k, 3.2 GB at B=2)
         # do not fit next to the activations, and every other position has label -100 anyway.
@@ -204,9 +219,7 @@ class ICWMPolicy(PreTrainedPolicy):
         )
         logits = outputs.logits[:, :-1]  # positions seq_len - keep .. seq_len - 2
         labels = all_labels[:, seq_len - keep + 1 :]
-        loss = torch.nn.functional.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100
-        )
+        loss = F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100)
         info = {"loss": loss.item()}
         with torch.no_grad():
             # Teacher-forced diagnostics over the supervised target-action tokens: a token is "right"
@@ -215,6 +228,39 @@ class ICWMPolicy(PreTrainedPolicy):
             pred = logits.argmax(-1)
             sup = labels != -100
             hit = (pred == labels) & sup
+            n_sup = sup.sum().clamp(min=1)
+            per_sample_ok = (hit.sum(1) == sup.sum(1)) & (sup.sum(1) > 0)
+            info.update(
+                {
+                    "token_acc": (hit.sum() / n_sup).item(),
+                    "exact_chunk_acc": per_sample_ok.float().mean().item(),
+                    "target_tokens_per_chunk": (sup.sum() / sup.shape[0]).item(),
+                    "seq_len": float(batch["attention_mask"].sum(1).float().mean().item()),
+                }
+            )
+        return loss, info
+
+    def _forward_sparse_logits(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+        """Same loss and diagnostics as `forward`, but the LM head runs only at the positions that predict a
+        supervised token (ICWM_SPARSE_LOGITS=1). The full [B, L, vocab] logits of a 5-clip sequence do not fit
+        at batch 16; every other position has label -100 and contributes nothing to the loss anyway."""
+        out = self.model.model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch.get("pixel_values"),
+            image_grid_thw=batch.get("image_grid_thw"),
+            use_cache=False,
+        )
+        labels = batch["labels"][:, 1:]
+        sup = labels != -100
+        h = out[0][:, :-1][sup]  # hidden state at position p predicts token p + 1
+        logits = self.model.lm_head(h).float()
+        tgt = labels[sup]
+        loss = F.cross_entropy(logits, tgt)  # mean over supervised tokens = HF ForCausalLMLoss
+        info = {"loss": loss.item()}
+        with torch.no_grad():
+            hit = torch.zeros_like(sup)
+            hit[sup] = logits.argmax(-1) == tgt
             n_sup = sup.sum().clamp(min=1)
             per_sample_ok = (hit.sum(1) == sup.sum(1)) & (sup.sum(1) > 0)
             info.update(

@@ -106,15 +106,24 @@ class ICWMConfig(PreTrainedConfig):
     #               before clip k+1 (the last clip H + g before the query), g ~ U[0, context_history_max_gap]
     #               so the stride cannot be used as a shortcut; clips that would start before the
     #               episode are blank (black frames, arm still, gripper open), as at inference.
-    #   "sametask_past": N clips from OTHER episodes of the query's own task (same viewpoint), each at
-    #               a random segment that ends at or before the query's step t, ordered by time.
+    #   "explore" : self-exploration probing clips recorded at the query's viewpoint, in a scene of the
+    #               query's task (build_icwm_explore_context.py: the eval's probe() run at training init
+    #               states). N distinct clips of one probing session, as at eval.
+    #   "sametask_past" : N clips from OTHER demos of the query's task (same viewpoint), each a random other demo and a
+    #               random segment ending at or before the query's step t, time-ordered (tvshift-wm); clips that do
+    #               not fit before t are left out (n_valid), none at all for t < H.
+    #   "pool_sametask" : as "pool" but only demo segments of OTHER episodes of the query's own task (any timestep).
+    #   "pool_past"     : as "sametask_past" but from OTHER episodes of ANY task at the viewpoint (segments ending by step t).
     #   "probe"   : N self-exploration clips of the query's own scene (task + viewpoint), recorded with
     #               the evaluation's probing routine (gen_icwm_probe_pool.py) -> same context
     #               distribution in training and at test time. Needs context_probe_dir.
     #   "mixed"   : both, as two marked segments: N "pool" clips ("Exploration:", world model of the
     #               viewpoint) then context_mixed_n_history "history" clips ("History:", the episode so far).
+    #               Prompt: markers only on non-empty segments, plus "Task:" before the query (see processor).
     context_source: str = "pool"
     context_history_max_gap: int = 15
+    # context_source="explore": dir with <viewpoint dataset name>__{frames,actions}.npy / __meta.json
+    context_explore_dir: str = ""
     context_probe_dir: str | None = None
     # "mixed" only: number of history clips, and the per-sample context dropout. With probability
     # context_drop_history_p only the exploration segment is kept, with probability
@@ -122,6 +131,17 @@ class ICWMConfig(PreTrainedConfig):
     context_mixed_n_history: int = 5
     context_drop_history_p: float = 0.0
     context_drop_explore_p: float = 0.0
+    # True: the context-clip actions get the same normalization (and stats) as the target action before
+    # FAST tokenization, so a motion maps to the same tokens in the context and in the target. False keeps
+    # the original behaviour (context actions tokenized raw) for checkpoints trained that way.
+    normalize_context_actions: bool = False
+    # Second context segment (needs context_match_viewpoint=True): the query's own episode, the
+    # n_history_clips chunks just before it (as context_source="history"), placed after the
+    # n_context_clips clips of context_source; the two segments are tagged "Exploration:" / "History:".
+    # history_dropout: probability a training query gets no history at all, so the first segment
+    # cannot be ignored in favour of copying the recent actions.
+    n_history_clips: int = 0
+    history_dropout: float = 0.0
 
     # --- Action chunking / FAST tokenization ----------------------------------------
     action_chunk_size: int = 5  # paper: action chunk size = 5
@@ -168,15 +188,20 @@ class ICWMConfig(PreTrainedConfig):
             )
         if self.n_context_clips < 0:
             raise ValueError(f"n_context_clips must be >= 0, got {self.n_context_clips}")
-        if self.context_source not in ("pool", "history", "sametask_past", "probe", "mixed"):
-            raise ValueError(f"context_source must be 'pool', 'history', 'sametask_past', 'probe' or 'mixed', "
-                             f"got {self.context_source!r}")
+        sources = ("pool", "pool_sametask", "pool_past", "history", "explore", "sametask_past", "probe", "mixed")
+        if self.context_source not in sources:
+            raise ValueError(f"context_source must be one of {sources}, got {self.context_source!r}")
+        if self.context_source != "pool" and not self.context_match_viewpoint:
+            raise ValueError(f"context_source={self.context_source!r} requires context_match_viewpoint=True")
+        if self.n_history_clips > 0 and (not self.context_match_viewpoint or self.context_source in ("history", "mixed")):
+            raise ValueError("n_history_clips > 0 needs context_match_viewpoint=True and context_source not in "
+                             "('history', 'mixed'); 'mixed' has its own context_mixed_n_history")
         if self.context_drop_history_p + self.context_drop_explore_p > 1.0:
             raise ValueError("context_drop_history_p + context_drop_explore_p must be <= 1")
         if self.context_source == "probe" and not self.context_probe_dir:
             raise ValueError("context_source='probe' requires context_probe_dir")
-        if self.context_source != "pool" and not self.context_match_viewpoint:
-            raise ValueError(f"context_source={self.context_source!r} requires context_match_viewpoint=True")
+        if self.context_source == "explore" and not self.context_explore_dir:
+            raise ValueError("context_source='explore' requires context_explore_dir")
 
         if self.vlm_config is None:
             require_package("transformers", extra="icwm")

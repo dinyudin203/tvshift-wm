@@ -200,8 +200,28 @@ class ICWMInteractionSegmentPool:
         like = real[0][0] if real else self.clip_at(d_idx, ep_start)[0]
         return [self.blank_clip(like)] * (n - len(real)) + real, len(real)
 
+
+    def sample_same_task(self, n: int, rng: np.random.Generator, episode: int):
+        """n clips (with replacement) from the segments of OTHER episodes of `episode`'s task, any timestep."""
+        if not hasattr(self, "_seg_by_task"):
+            ep_task = {}
+            for ds in self.datasets:
+                task_col = np.asarray(ds.hf_dataset.select_columns("task_index")["task_index"]).reshape(-1)
+                for row in ds.meta.episodes:
+                    ep_task[int(row["episode_index"])] = int(task_col[int(row["dataset_from_index"])])
+            assert len(self.datasets) == 1, "episode indices are per dataset"
+            self._ep_task = ep_task
+            self._seg_by_task = {}
+            for i, e in enumerate(self._segment_episode):
+                self._seg_by_task.setdefault(ep_task[e], []).append(i)
+            self._seg_by_task = {t: np.asarray(v) for t, v in self._seg_by_task.items()}
+        cand = self._seg_by_task[self._ep_task[episode]]
+        cand = cand[np.asarray(self._segment_episode)[cand] != episode]
+        return [self.clip_at(*self._segments[i]) for i in cand[rng.integers(0, len(cand), size=n)]]
+
+    # ported verbatim from dinyudin203/tvshift-wm (icwm_libero_tvshift_sametask run)
     def same_task_past(self, d_idx: int, episode: int, t: int, n: int,
-                       rng: np.random.Generator) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+                       rng: np.random.Generator, any_task: bool = False) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """n clips from OTHER episodes of the query's task, all ending at or before episode step `t`.
 
         Each clip: a random other episode of the same task, a random start offset s with
@@ -222,7 +242,8 @@ class ICWMInteractionSegmentPool:
             self._task_eps[d_idx] = (eps, by_task)
         eps, by_task = self._task_eps[d_idx]
         a, _, task = eps[episode]
-        others = [e for e in by_task[task] if e != episode]
+        # any_task (context_source="pool_past"): other episodes of every task in this viewpoint dataset
+        others = [e for e in (eps if any_task else by_task[task]) if e != episode]
         picks = []
         for _ in range(n):
             e = others[int(rng.integers(0, len(others)))]
@@ -234,6 +255,38 @@ class ICWMInteractionSegmentPool:
         real = [self.clip_at(d_idx, ea + s) for s, ea in picks]
         like = real[0][0] if real else self.clip_at(d_idx, a)[0]
         return [self.blank_clip(like)] * (n - len(real)) + real, len(real)
+
+
+class ICWMExploreContext:
+    """Self-exploration probing clips of one viewpoint (build_icwm_explore_context.py output).
+
+    A session is one probing run (20 moves) from one initial state; clip i of a session is
+    (o_i, a_i, o_i+1). `sample` picks one session of the query's task (any session of the
+    viewpoint if the task has none) and N distinct clips of it -- what the eval does per episode.
+    """
+
+    def __init__(self, root: str, name: str):
+        import json
+
+        root = Path(root)
+        self.frames = np.load(root / f"{name}__frames.npy", mmap_mode="r")  # [S, P+1, H, W, 3] uint8
+        self.actions = np.load(root / f"{name}__actions.npy")  # [S, P, horizon, action_dim]
+        meta = json.loads((root / f"{name}__meta.json").read_text())
+        assert len(meta) == len(self.frames) == len(self.actions), name
+        self.by_prompt: dict[str, list[int]] = {}
+        for s, m in enumerate(meta):
+            self.by_prompt.setdefault(m["prompt"], []).append(s)
+        logger.info("ICWMExploreContext %s: %d sessions x %d clips, tasks %s",
+                    name, len(meta), self.actions.shape[1], {p: len(v) for p, v in self.by_prompt.items()})
+
+    def sample(self, n: int, rng: np.random.Generator, prompt: str | None = None):
+        sessions = self.by_prompt.get(prompt) or range(len(self.frames))
+        s = int(rng.choice(sessions))
+        p = self.actions.shape[1]
+        pick = rng.choice(p, size=n, replace=p < n)
+        chw = lambda a: torch.from_numpy(np.array(a)).permute(2, 0, 1).float().div_(255.0)  # noqa: E731  (copy: memmap is read-only)
+        return [(chw(self.frames[s, i]), chw(self.frames[s, i + 1]), torch.from_numpy(self.actions[s, i].copy()))
+                for i in pick]
 
 
 class ICWMContextSampledDataset(Dataset):
@@ -357,19 +410,25 @@ class ICWMViewpointMatchedDataset(Dataset):
 
     def __init__(self, query_datasets, pool_datasets, horizon, n_context_clips=5, stride=20,
                  image_key="observation.images.image", action_key="action", seed=0,
-                 context_source="pool", history_max_gap=15, probe_dir=None,
-                 n_history_clips=5, drop_history_p=0.0, drop_explore_p=0.0):
+                 context_source="pool", history_max_gap=15, explore_dir="", n_history_clips=0, history_dropout=0.0,
+                 probe_dir=None, n_mixed_history=5, drop_history_p=0.0, drop_explore_p=0.0):
         from lerobot.datasets.compute_stats import aggregate_stats
 
         assert len(query_datasets) == len(pool_datasets)
-        assert context_source in ("pool", "history", "sametask_past", "probe", "mixed"), context_source
+        assert context_source in ("pool", "pool_sametask", "pool_past", "history", "explore", "sametask_past",
+                                  "probe", "mixed"), context_source
         self.context_source = context_source
+        if context_source == "explore":
+            self.explore = [ICWMExploreContext(explore_dir, Path(d.root).name) for d in query_datasets]
+        self.history_max_gap = history_max_gap
         self.n_history_clips = n_history_clips
+        self.history_dropout = history_dropout
+        # context_source="mixed" (exploration + history segments with per-sample dropout) / "probe"
+        self.n_mixed_history = n_mixed_history
         self.drop_history_p = drop_history_p
         self.drop_explore_p = drop_explore_p
         self.probe_dir = probe_dir
         self._probes = {}
-        self.history_max_gap = history_max_gap
         self.query_datasets = query_datasets
         self.pools = [
             ICWMInteractionSegmentPool(datasets=[d], horizon=horizon, stride=stride,
@@ -409,8 +468,6 @@ class ICWMViewpointMatchedDataset(Dataset):
         """n_context_clips probing clips (uniform, with replacement) of scene (dataset k, task_index)."""
         key = (k, task_index)
         if key not in self._probes:  # memmaps opened lazily, once per DataLoader worker
-            from pathlib import Path
-
             tag = Path(self.probe_dir) / f"{Path(str(self.query_datasets[k].root)).name}__task{task_index}"
             if not Path(f"{tag}__meta.json").exists():
                 raise FileNotFoundError(f"no finished probe pool {tag}__*")
@@ -432,7 +489,7 @@ class ICWMViewpointMatchedDataset(Dataset):
             # exploration segment ("pool": same viewpoint, other episodes) + history segment (own episode)
             ep = self.query_datasets[k].meta.episodes[int(item["episode_index"])]
             hist, n_hist = self.pools[k].history(0, int(item["index"]), int(ep["dataset_from_index"]),
-                                                 self.n_history_clips, self.history_max_gap, self._rng)
+                                                 self.n_mixed_history, self.history_max_gap, self._rng)
             clips = self.pools[k].sample(self.n_context_clips, self._rng, exclude_episode=int(item["episode_index"]))
             n_explore = self.n_context_clips
             # context dropout: keep one segment only, so each source stays usable on its own.
@@ -447,6 +504,9 @@ class ICWMViewpointMatchedDataset(Dataset):
             item[ICWM_HISTORY_OBS_START] = torch.stack([c[0] for c in hist])
             item[ICWM_HISTORY_OBS_END] = torch.stack([c[1] for c in hist])
             item[ICWM_HISTORY_ACTIONS] = torch.stack([c[2] for c in hist])
+        elif self.context_source == "probe":
+            # self-exploration clips of the query's own scene, as recorded at test time
+            clips = self._probe_clips(k, int(item["task_index"]))
         elif self.context_source == "history":
             # the query's own episode: the chunks executed just before it (Reflective-VLA style)
             ep = self.query_datasets[k].meta.episodes[int(item["episode_index"])]
@@ -454,20 +514,41 @@ class ICWMViewpointMatchedDataset(Dataset):
                                                   self.n_context_clips, self.history_max_gap, self._rng)
             # Reflective VLA masks frames before the episode start: only the real clips enter the sequence
             item[ICWM_CONTEXT_N_VALID] = torch.tensor(n_real)
-        elif self.context_source == "sametask_past":
-            # other demos of the query's task, only segments that end before the query's step
+        elif self.context_source in ("sametask_past", "pool_past"):
+            # other demos of the query's task, only segments that end before the query's step (tvshift-wm);
+            # a per-item generator so the forked DataLoader workers do not repeat each other's draws
+            rng = np.random.default_rng(int(torch.randint(0, 2**62, (1,))))
             ep = self.query_datasets[k].meta.episodes[int(item["episode_index"])]
             t = int(item["index"]) - int(ep["dataset_from_index"])
-            clips, n_real = self.pools[k].same_task_past(0, int(item["episode_index"]), t,
-                                                         self.n_context_clips, self._rng)
+            clips, n_real = self.pools[k].same_task_past(0, int(item["episode_index"]), t, self.n_context_clips, rng,
+                                                         any_task=self.context_source == "pool_past")
             item[ICWM_CONTEXT_N_VALID] = torch.tensor(n_real)
-        elif self.context_source == "probe":
-            # self-exploration clips of the query's own scene, as recorded at test time
-            clips = self._probe_clips(k, int(item["task_index"]))
+        elif self.context_source == "explore":
+            # self-exploration probing clips at the query's viewpoint, in a scene of the query's task;
+            # a per-item generator so the forked DataLoader workers do not repeat each other's draws
+            rng = np.random.default_rng(int(torch.randint(0, 2**62, (1,))))
+            clips = self.explore[k].sample(self.n_context_clips, rng, item.get("task"))
+        elif self.context_source == "pool_sametask":
+            # demo segments of OTHER episodes of the query's task at the query's viewpoint, any timestep;
+            # a per-item generator so the forked DataLoader workers do not repeat each other's draws
+            rng = np.random.default_rng(int(torch.randint(0, 2**62, (1,))))
+            clips = self.pools[k].sample_same_task(self.n_context_clips, rng, int(item["episode_index"]))
         else:
             # clips from the query's own viewpoint, but never from the query's own episode
             clips = self.pools[k].sample(self.n_context_clips, self._rng, exclude_episode=int(item["episode_index"]))
         item[ICWM_CONTEXT_OBS_START] = torch.stack([c[0] for c in clips])
         item[ICWM_CONTEXT_OBS_END] = torch.stack([c[1] for c in clips])
         item[ICWM_CONTEXT_ACTIONS] = torch.stack([c[2] for c in clips])
+        if self.n_history_clips > 0:
+            # second segment: the query's own recent chunks; dropped entirely with prob history_dropout
+            rng = np.random.default_rng(int(torch.randint(0, 2**62, (1,))))
+            ep = self.query_datasets[k].meta.episodes[int(item["episode_index"])]
+            hist, n_real = self.pools[k].history(0, int(item["index"]), int(ep["dataset_from_index"]),
+                                                 self.n_history_clips, self.history_max_gap, rng)
+            if rng.random() < self.history_dropout:
+                n_real = 0
+            item[ICWM_HISTORY_OBS_START] = torch.stack([c[0] for c in hist])
+            item[ICWM_HISTORY_OBS_END] = torch.stack([c[1] for c in hist])
+            item[ICWM_HISTORY_ACTIONS] = torch.stack([c[2] for c in hist])
+            item[ICWM_HISTORY_N_VALID] = torch.tensor(n_real)
         return item
