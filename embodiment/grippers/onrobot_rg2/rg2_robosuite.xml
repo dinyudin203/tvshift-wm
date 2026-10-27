@@ -1,0 +1,96 @@
+<!-- OnRobot RG2 for robosuite, built like grippers/robotiq_2f85_menagerie_orig/2f85_menagerie_localfinger_nolinkcol_robosuite.xml.
+     Linkage from John-A-Chen/onrobot-rg2-mujoco rg2.xml (parallel 4-bar via joint equalities: inner knuckle = driver,
+     inner finger = -driver, right = left), meshes from tonydle/OnRobot_ROS2_Description.
+     Changes: robosuite eef/grip_site + ft sensor (fingers along grip-site x, same as the 2F-85 file); driver range opened to
+     -0.1 (82.9 mm between the finger faces, 2F-85 85 mm / Panda 80 mm); linkage collision meshes disabled, box pads on the flat
+     inner finger face (z 0.183-0.217 above the flange when open) are the only finger colliders; Menagerie-style equality
+     solver values; position servo on the left driver. Base flange at z=0, closed (faces touching) at driver ~0.78.
+     grip_site placed so the open fingertips are 4.4 mm beyond it along the approach axis, as on the Panda hand and the 2F-85 file. -->
+<mujoco model="onrobot_rg2">
+  <compiler angle="radian" autolimits="true" />
+  <asset>
+    <material name="rg2_silver" rgba="0.72 0.72 0.70 1" />
+    <material name="rg2_dark" rgba="0.12 0.12 0.12 1" />
+    <mesh name="base_link_vis" file="assets/base_link_vis.stl" />
+    <mesh name="outer_knuckle_vis" file="assets/outer_knuckle_vis.stl" />
+    <mesh name="inner_knuckle_vis" file="assets/inner_knuckle_vis.stl" />
+    <mesh name="inner_finger_vis" file="assets/inner_finger_vis.stl" />
+    <mesh name="base_link_col" file="assets/base_link_col.stl" />
+  </asset>
+  <worldbody>
+    <body name="base_mount" pos="0 0 0">
+      <site name="ft_frame" pos="0 0 0" size="0.01 0.01 0.01" rgba="1 0 0 1" type="sphere" group="1" />
+      <body name="eef" pos="0 0 0.2084" quat="0.707105 0 0 -0.707105">
+        <site name="grip_site" pos="0 0 0" size="0.01 0.01 0.01" rgba="1 0 0 0.5" type="sphere" group="1" />
+        <site name="ee_x" pos="0.1 0 0" size="0.005 .1" quat="0.707105 0 0.707108 0" rgba="1 0 0 0" type="cylinder" group="1" />
+        <site name="ee_y" pos="0 0.1 0" size="0.005 .1" quat="0.707105 0.707108 0 0" rgba="0 1 0 0" type="cylinder" group="1" />
+        <site name="ee_z" pos="0 0 0.1" size="0.005 .1" quat="1 0 0 0" rgba="0 0 1 0" type="cylinder" group="1" />
+        <site name="grip_site_cylinder" pos="0 0 0" size="0.005 10" rgba="0 1 0 0.3" type="cylinder" group="1" />
+      </body>
+      <body name="base" pos="0 0 0">
+        <inertial pos="0 0 0.06" mass="0.78" diaginertia="0.0010 0.0010 0.0010" />
+        <geom mesh="base_link_vis" material="rg2_silver" type="mesh" contype="0" conaffinity="0" group="1" />
+        <geom mesh="base_link_col" type="mesh" group="0" />
+
+        <body name="left_outer_knuckle" pos="0 -0.017178 0.125797">
+          <joint name="left_driver_joint" axis="-1 0 0" range="-0.1 0.8" armature="0.005" damping="0.1" solimplimit="0.95 0.99 0.001" solreflimit="0.005 1" />
+          <inertial pos="0 -0.018 0.015" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+          <geom mesh="outer_knuckle_vis" material="rg2_silver" type="mesh" contype="0" conaffinity="0" group="1" />
+          <body name="left_inner_finger" pos="0 -0.039592 0.038177">
+            <joint name="left_inner_finger_joint" axis="-1 0 0" range="-0.8 0.1" armature="0.001" damping="0.05" />
+            <inertial pos="0 0.008 0.025" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+            <geom mesh="inner_finger_vis" material="rg2_dark" type="mesh" contype="0" conaffinity="0" group="1" />
+            <geom name="left_pad1" type="box" group="0" mass="0" pos="0 0.015 0.0445" size="0.0095 0.004 0.0085" friction="0.8" solimp="0.95 0.99 0.001" solref="0.004 1" priority="1" rgba="0.3 0.3 0.3 1" />
+            <geom name="left_pad2" type="box" group="0" mass="0" pos="0 0.015 0.0275" size="0.0095 0.004 0.0085" friction="0.7" solimp="0.95 0.99 0.001" solref="0.004 1" priority="1" rgba="0.3 0.3 0.3 1" />
+          </body>
+        </body>
+        <body name="left_inner_knuckle" pos="0 -0.007678 0.142297">
+          <joint name="left_inner_knuckle_joint" axis="-1 0 0" range="-0.1 0.8" armature="0.001" damping="0.05" />
+          <inertial pos="0 -0.018 0.015" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+          <geom mesh="inner_knuckle_vis" material="rg2_silver" type="mesh" contype="0" conaffinity="0" group="1" />
+        </body>
+
+        <body name="right_outer_knuckle" pos="0 0.017178 0.125797" quat="0 0 0 1">
+          <joint name="right_driver_joint" axis="-1 0 0" range="-0.1 0.8" armature="0.005" damping="0.1" solimplimit="0.95 0.99 0.001" solreflimit="0.005 1" />
+          <inertial pos="0 -0.018 0.015" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+          <geom mesh="outer_knuckle_vis" material="rg2_silver" type="mesh" contype="0" conaffinity="0" group="1" />
+          <body name="right_inner_finger" pos="0 -0.039592 0.038177">
+            <joint name="right_inner_finger_joint" axis="-1 0 0" range="-0.8 0.1" armature="0.001" damping="0.05" />
+            <inertial pos="0 0.008 0.025" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+            <geom mesh="inner_finger_vis" material="rg2_dark" type="mesh" contype="0" conaffinity="0" group="1" />
+            <geom name="right_pad1" type="box" group="0" mass="0" pos="0 0.015 0.0445" size="0.0095 0.004 0.0085" friction="0.8" solimp="0.95 0.99 0.001" solref="0.004 1" priority="1" rgba="0.3 0.3 0.3 1" />
+            <geom name="right_pad2" type="box" group="0" mass="0" pos="0 0.015 0.0275" size="0.0095 0.004 0.0085" friction="0.7" solimp="0.95 0.99 0.001" solref="0.004 1" priority="1" rgba="0.3 0.3 0.3 1" />
+          </body>
+        </body>
+        <body name="right_inner_knuckle" pos="0 0.007678 0.142297" quat="0 0 0 1">
+          <joint name="right_inner_knuckle_joint" axis="-1 0 0" range="-0.1 0.8" armature="0.001" damping="0.05" />
+          <inertial pos="0 -0.018 0.015" mass="0.05" diaginertia="0.00002 0.00002 0.00002" />
+          <geom mesh="inner_knuckle_vis" material="rg2_silver" type="mesh" contype="0" conaffinity="0" group="1" />
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <contact>
+    <exclude body1="base" body2="left_outer_knuckle" />
+    <exclude body1="base" body2="right_outer_knuckle" />
+    <exclude body1="base" body2="left_inner_knuckle" />
+    <exclude body1="base" body2="right_inner_knuckle" />
+    <exclude body1="base" body2="left_inner_finger" />
+    <exclude body1="base" body2="right_inner_finger" />
+    <exclude body1="left_inner_finger" body2="right_inner_finger" />
+  </contact>
+  <equality>
+    <joint joint1="right_driver_joint" joint2="left_driver_joint" polycoef="0 1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1" />
+    <joint joint1="left_inner_knuckle_joint" joint2="left_driver_joint" polycoef="0 1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1" />
+    <joint joint1="right_inner_knuckle_joint" joint2="right_driver_joint" polycoef="0 1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1" />
+    <joint joint1="left_inner_finger_joint" joint2="left_driver_joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1" />
+    <joint joint1="right_inner_finger_joint" joint2="right_driver_joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1" />
+  </equality>
+  <actuator>
+    <general name="fingers_actuator" joint="left_driver_joint" forcerange="-5 5" ctrlrange="-0.1 0.78" gainprm="50 0 0" biasprm="0 -50 -1" biastype="affine" />
+  </actuator>
+  <sensor>
+    <force name="force_ee" site="ft_frame" />
+    <torque name="torque_ee" site="ft_frame" />
+  </sensor>
+</mujoco>
