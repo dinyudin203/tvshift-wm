@@ -88,3 +88,25 @@ python experiments/libero/run_libero_manager.py task=libero_joint_2cam224_rot9_1
 이 컨테이너에는 NVIDIA EGL/GL 라이브러리가 없어 MuJoCo offscreen 이 소프트웨어
 렌더링(llvmpipe)으로 돈다. 프로세스당 약 4~5 renders/s 이고 프로세스 병렬은
 거의 선형으로 스케일해서, 30 워커로 전체 생성에 1.5~2시간 정도 걸린다.
+
+## v2wrist — front + wrist 카메라 동시 perturbation (`run_v2wrist_pipeline.sh`)
+
+tvshift v2 (front 카메라 3시점) 에 wrist(eye_in_hand) 카메라 회전을 추가한 데이터셋.
+HF: `dinyu/tvshift-libero-v2wrist-lerobot` (private).
+
+| suite / task | front (agentview) | wrist |
+|---|---|---|
+| spatial 1, 3 | 0° | 0° (v2 spatial theta000 그대로 재사용) |
+| goal 0, 7 | 45° | +30° |
+| object 0, 1 | 330° | −30° |
+
+- wrist 회전: `render_shard.py --wrist-deg` → `rotate_wrist_camera`. 카메라의 부모 body
+  `robot0_right_hand` 의 z축(= gripper 접근축, body 원점 통과) 기준으로 회전
+  (`cam_pos = Rz(φ) p0`, `cam_quat = q_z(φ) ⊗ q0`). 카메라가 축에서 5cm 떨어져 있어
+  이미지 roll + 약간의 시점 이동이 생긴다. ±45° 이상이면 손가락이 시야를 가려서 ±30° 를 사용.
+- env 를 만든 뒤 한 번만 model 을 수정한다 (`hard_reset=False` 라 reset 후에도 유지).
+- manifest 에 `wrist_deg` 기록. 평가 환경은 `icwm/env_worker_wrist.py` (reset 마다 절대 pose 로 설정).
+
+```bash
+B=/dataset/yujin/data/v2wrist bash tvshift/data/run_v2wrist_pipeline.sh
+```

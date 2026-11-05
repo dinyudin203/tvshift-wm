@@ -12,3 +12,4 @@ logs/
 *.npz
 .venv*/
 conda_env*/
+MUJOCO_LOG.TXT

@@ -3,6 +3,7 @@ Stage A: LIBERO demo 를 states 리플레이하면서 agentview 를 여러 theta
 
 - 카메라는 robot base(robot0_link0) 의 z축 기준으로 theta 도 회전 (only_rotate_dataset.py 와 동일한 수식)
 - wrist(eye_in_hand) 는 카메라 회전과 무관하므로 demo 당 한 번만 렌더링해서 모든 theta 가 공유
+  (--wrist-deg: wrist 카메라를 gripper 접근축 기준으로 회전시켜 렌더링, rotate_wrist_camera)
 - 에피소드 단위로 mp4(h264) + parquet 을 shard 디렉토리에 떨궈두고, Stage B(pack_lerobot.py)가
   이것들을 LeRobot v3.0 데이터셋으로 합친다.
 
@@ -60,6 +61,16 @@ def rotated_camera_pose(cam_pos, cam_quat, base_pos, base_quat, theta_deg):
     return new_cam_world.position, new_cam_world.orientation
 
 
+def rotate_wrist_camera(model, deg):
+    """wrist(eye_in_hand) 카메라를 부모 body(robot0_right_hand) 의 z축(= gripper 접근축, body 원점 통과) 기준으로 deg 회전.
+    카메라가 축에서 5cm 떨어져 있어서 이미지 roll + 약간의 시점 이동이 같이 생긴다. model 을 직접 수정 (한 번만 호출)."""
+    wid = model.camera_name2id(WRIST_CAMERA_NAME)
+    a = np.deg2rad(deg)
+    rz = np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+    model.cam_pos[wid] = rz @ model.cam_pos[wid]
+    model.cam_quat[wid] = quaternions.qmult([np.cos(a / 2), 0.0, 0.0, np.sin(a / 2)], model.cam_quat[wid])  # wxyz
+
+
 # ---------------------------------------------------------------- no-op filter
 def is_noop(action, prev_action=None, threshold=1e-4):
     """openvla/modified_libero_rlds 와 동일한 no-op 판정."""
@@ -101,6 +112,8 @@ def main():
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-existing", action="store_true", default=True)
+    ap.add_argument("--wrist-deg", type=float, default=0.0,
+                    help="wrist(eye_in_hand) 카메라를 gripper 접근축(hand body z축) 기준으로 이 각도만큼 회전 (손목 둘레 장착 위치 변경)")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -133,6 +146,8 @@ def main():
     env.seed(0)
     env.reset()
     sim = env.env.sim
+    if args.wrist_deg:  # hard_reset=False 라 model 수정이 유지됨
+        rotate_wrist_camera(sim.model, args.wrist_deg)
 
     cam_id = sim.model.camera_name2id(CAMERA_NAME)
     orig_cam_pos = sim.model.cam_pos[cam_id].copy()
@@ -231,6 +246,7 @@ def main():
                     "length": int(len(keep)),
                     "raw_length": int(len(actions)),
                     "thetas": args.thetas,
+                    "wrist_deg": args.wrist_deg,
                     "res": args.res,
                     "fps": args.fps,
                 },
