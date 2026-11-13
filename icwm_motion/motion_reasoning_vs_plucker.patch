@@ -1,0 +1,593 @@
+diff --git a/code/src/lerobot/datasets/factory.py b/code/src/lerobot/datasets/factory.py
+index 6dd8793..20840ec 100755
+--- a/code/src/lerobot/datasets/factory.py
++++ b/code/src/lerobot/datasets/factory.py
+@@ -130,7 +130,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
+                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+ 
+     dataset = _maybe_wrap_icwm_context_sampler(cfg, dataset)
+-    if getattr(cfg.trainable_config, "use_plucker", False) or getattr(cfg.trainable_config, "plucker_reasoning", False) or getattr(cfg.trainable_config, "use_camera_tokens", False):
++    if getattr(cfg.trainable_config, "use_plucker", False) or getattr(cfg.trainable_config, "plucker_reasoning", False) or getattr(cfg.trainable_config, "use_camera_tokens", False) or getattr(cfg.trainable_config, "motion_reasoning", False):
+         if cfg.dataset.image_transforms.enable:
+             raise ValueError("RGB augmentation requires matching calibration transforms; disable image_transforms")
+         from .icwm_plucker_dataset import attach_plucker_calibration
+diff --git a/code/src/lerobot/datasets/icwm_plucker_dataset.py b/code/src/lerobot/datasets/icwm_plucker_dataset.py
+index 9130bf6..86c2bdd 100755
+--- a/code/src/lerobot/datasets/icwm_plucker_dataset.py
++++ b/code/src/lerobot/datasets/icwm_plucker_dataset.py
+@@ -64,7 +64,8 @@ class ICWMPluckerCalibratedDataset(Dataset):
+         return item
+ 
+ def attach_plucker_calibration(cfg, dataset):
+-    if not (cfg.use_plucker or cfg.plucker_reasoning or getattr(cfg, 'use_camera_tokens', False)):
++    if not (cfg.use_plucker or cfg.plucker_reasoning or getattr(cfg, 'use_camera_tokens', False)
++            or getattr(cfg, 'motion_reasoning', False)):
+         return dataset
+     if not cfg.plucker_calibration_dir:
+         raise ValueError('Plucker training requires plucker_calibration_dir')
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/__init__.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/__init__.cpython-38.pyc
+new file mode 100644
+index 0000000..8b95feb
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/__init__.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/action_expert.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/action_expert.cpython-38.pyc
+new file mode 100644
+index 0000000..1a7bab2
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/action_expert.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/configuration_icwm.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/configuration_icwm.cpython-38.pyc
+new file mode 100644
+index 0000000..557f895
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/configuration_icwm.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/modeling_icwm.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/modeling_icwm.cpython-38.pyc
+new file mode 100644
+index 0000000..2f44f60
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/modeling_icwm.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/motion_reasoning.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/motion_reasoning.cpython-38.pyc
+new file mode 100644
+index 0000000..deb8fcd
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/motion_reasoning.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/plucker.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/plucker.cpython-38.pyc
+new file mode 100644
+index 0000000..c6bd00a
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/plucker.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/__pycache__/processor_icwm.cpython-38.pyc b/code/src/lerobot/policies/icwm/__pycache__/processor_icwm.cpython-38.pyc
+new file mode 100644
+index 0000000..6ddd031
+Binary files /dev/null and b/code/src/lerobot/policies/icwm/__pycache__/processor_icwm.cpython-38.pyc differ
+diff --git a/code/src/lerobot/policies/icwm/action_expert.py b/code/src/lerobot/policies/icwm/action_expert.py
+new file mode 100644
+index 0000000..dc1ebfd
+--- /dev/null
++++ b/code/src/lerobot/policies/icwm/action_expert.py
+@@ -0,0 +1,84 @@
++"""Flow-matching action expert for knowledge-insulated (KI) ICWM.
++
++pi0.5-KI / LAP style (LAP: `stop_action_to_vlm_grad`, which stop-gradients the VLM keys and values the
++action expert attends to): the VLM is trained only by next-token losses (motion reasoning, optionally
++FAST action tokens); the expert regresses the flow-matching velocity of the continuous action chunk while
++reading the VLM's hidden states through `.detach()`, so no action-expert gradient ever reaches the VLM.
++
++Each expert layer = bidirectional self-attention over the action tokens, cross-attention to the (detached,
++layer-normed, projected) hidden states of one VLM layer (spread evenly over the VLM depth, last expert
++layer <-> last VLM layer), MLP. The cross-attention keys are the prefix (context clips, query image,
++instruction) and the motion-reasoning answer, never the FAST action tokens that may follow it.
++"""
++from __future__ import annotations
++
++import math
++
++import torch
++import torch.nn.functional as F
++from torch import Tensor, nn
++
++
++def sincos_time(t: Tensor, dim: int, max_period: float = 4.0, min_period: float = 4e-3) -> Tensor:
++    """pi0's sine-cosine embedding of the flow time t in [0, 1]."""
++    frac = torch.linspace(0.0, 1.0, dim // 2, device=t.device, dtype=torch.float64)
++    period = min_period * (max_period / min_period) ** frac
++    x = t.to(torch.float64)[:, None] * (2 * math.pi / period)[None]
++    return torch.cat([x.sin(), x.cos()], dim=-1).float()
++
++
++class FlowActionExpert(nn.Module):
++    def __init__(self, vlm_width: int, vlm_layers: int, action_dim: int, chunk: int,
++                 width: int = 1024, depth: int = 8, heads: int = 16, mlp_ratio: int = 4):
++        super().__init__()
++        self.action_dim, self.chunk, self.width = action_dim, chunk, width
++        # hidden_states[0] is the embedding output, hidden_states[i] the output of decoder layer i
++        self.layer_ids = [max(1, round((i + 1) * vlm_layers / depth)) for i in range(depth)]
++        self.ctx_norm = nn.ModuleList(nn.LayerNorm(vlm_width) for _ in range(depth))
++        self.ctx_proj = nn.ModuleList(nn.Linear(vlm_width, width) for _ in range(depth))
++        self.in_proj = nn.Linear(action_dim, width)
++        self.time_mlp = nn.Sequential(nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width))
++        self.pos = nn.Parameter(torch.zeros(chunk, width))
++        nn.init.normal_(self.pos, std=0.02)
++        self.layers = nn.ModuleList(
++            nn.TransformerDecoderLayer(width, heads, mlp_ratio * width, dropout=0.0, activation="gelu",
++                                       batch_first=True, norm_first=True)
++            for _ in range(depth)
++        )
++        self.out_norm = nn.LayerNorm(width)
++        self.out = nn.Linear(width, action_dim)
++
++    def forward(self, x_t: Tensor, t: Tensor, hidden_states, key_mask: Tensor) -> Tensor:
++        """x_t (B, chunk, D), t (B,), hidden_states: tuple of (B, L, vlm_width), key_mask (B, L) True = attend."""
++        dtype = self.in_proj.weight.dtype
++        h = self.in_proj(x_t.to(dtype)) + self.time_mlp(sincos_time(t, self.width).to(dtype))[:, None] + self.pos
++        pad = ~key_mask.bool()
++        for k, layer in enumerate(self.layers):
++            ctx = hidden_states[self.layer_ids[k]].detach()  # knowledge insulation: no grad into the VLM
++            mem = self.ctx_proj[k](self.ctx_norm[k](ctx.to(dtype)))
++            h = layer(h, mem, memory_key_padding_mask=pad)
++        return self.out(self.out_norm(h))
++
++    def loss(self, actions: Tensor, hidden_states, key_mask: Tensor, is_pad: Tensor | None = None):
++        """Conditional flow matching (pi0 convention): x_t = t*noise + (1-t)*a, target velocity noise - a."""
++        b = actions.shape[0]
++        actions = actions.float()
++        noise = torch.randn_like(actions)
++        t = torch.distributions.Beta(1.5, 1.0).sample((b,)).to(actions.device) * 0.999 + 0.001
++        x_t = t[:, None, None] * noise + (1 - t[:, None, None]) * actions
++        v = self(x_t, t, hidden_states, key_mask).float()
++        err = F.mse_loss(v, noise - actions, reduction="none").mean(-1)  # (B, chunk)
++        if is_pad is not None:
++            keep = (~is_pad.bool()).float()
++            return (err * keep).sum() / keep.sum().clamp(min=1)
++        return err.mean()
++
++    @torch.no_grad()
++    def sample(self, hidden_states, key_mask: Tensor, num_steps: int = 10) -> Tensor:
++        b = key_mask.shape[0]
++        x = torch.randn(b, self.chunk, self.action_dim, device=key_mask.device)
++        dt = -1.0 / num_steps
++        for i in range(num_steps):
++            t = torch.full((b,), 1.0 + i * dt, device=x.device)
++            x = x + dt * self(x, t, hidden_states, key_mask).float()
++        return x
+diff --git a/code/src/lerobot/policies/icwm/configuration_icwm.py b/code/src/lerobot/policies/icwm/configuration_icwm.py
+index cfd3a07..1ee3ded 100755
+--- a/code/src/lerobot/policies/icwm/configuration_icwm.py
++++ b/code/src/lerobot/policies/icwm/configuration_icwm.py
+@@ -136,6 +136,33 @@ class ICWMConfig(PreTrainedConfig):
+     camera_token_grid: int = 4
+     camera_token_hidden: int = 512
+ 
++    # Pixel-axis motion reasoning (motion_reasoning.py): before acting, the policy writes the delta-EEF
++    # (robot-base frame) that would move the gripper motion_reasoning_cm along image +x / +y / +z in the
++    # query camera, as text numbers, e.g. "x:+0.92,+0.01,-0.10;y:...;z:...;". Camera calibration
++    # (plucker_calibration_dir, plucker_frame=base) is the target at training, not an input.
++    #   mode "molmoact": answer = [reasoning text][FAST action tokens], one next-token CE over both,
++    #                    so the action loss trains the VLM (MolmoAct-style reason-then-act).
++    #   mode "ki"      : knowledge insulation (LAP / pi0.5-KI): the VLM gets the reasoning CE (+ the FAST
++    #                    action CE when ki_vlm_fast_loss); a flow-matching action expert reads the VLM's
++    #                    hidden states of prefix + reasoning through stop-gradient and its actions are the
++    #                    ones executed.
++    motion_reasoning: bool = False
++    motion_reasoning_mode: str = "molmoact"
++    motion_reasoning_cm: float = 5.0
++    motion_reasoning_units: str = "chunk_step"  # context_step | chunk_step | total | cm
++    # m of EEF travel per raw action unit per step, (x, y, z); least squares on the pair5 data (95k 5-step windows)
++    motion_reasoning_gain: tuple[float, float, float] = (0.01092, 0.01245, 0.01072)
++    motion_reasoning_decimals: int = 2
++    motion_reasoning_loss_weight: float = 1.0
++    motion_reasoning_max_tokens: int = 96
++    ki_vlm_fast_loss: bool = True
++    action_expert_width: int = 1024
++    action_expert_depth: int = 8
++    action_expert_heads: int = 16
++    action_expert_loss_weight: float = 1.0
++    action_expert_lr: float = 0.0  # 0 = optimizer_lr
++    flow_num_steps: int = 10
++
+     # --- In-context world modeling ---------------------------------------------------
+     # N interaction clips T = {(o^s_i, a_i, o^e_i)}, i = 1..N, prepended to the task query.
+     n_context_clips: int = 5
+@@ -276,6 +303,18 @@ class ICWMConfig(PreTrainedConfig):
+                 raise ValueError("plucker_convention must be opengl or opencv")
+             if self.plucker_channel_order not in ("moment_direction", "direction_moment"):
+                 raise ValueError("invalid Plucker channel order")
++        if self.motion_reasoning:
++            if self.use_plucker or self.plucker_reasoning or self.use_camera_tokens:
++                raise ValueError("motion_reasoning infers the camera itself; disable use_plucker / plucker_reasoning / "
++                                 "use_camera_tokens")
++            if self.motion_reasoning_mode not in ("molmoact", "ki"):
++                raise ValueError("motion_reasoning_mode must be molmoact or ki")
++            if self.motion_reasoning_units not in ("context_step", "chunk_step", "total", "cm"):
++                raise ValueError("motion_reasoning_units must be context_step, chunk_step, total or cm")
++            if self.motion_reasoning_cm <= 0 or len(self.motion_reasoning_gain) != 3 or min(self.motion_reasoning_gain) <= 0:
++                raise ValueError("invalid motion_reasoning_cm or motion_reasoning_gain")
++            if self.plucker_convention != "opengl":
++                raise ValueError("the calibration sidecars use OpenGL camera axes")
+         if self.context_source not in ("pool", "pool_sametask", "pool_past", "history", "explore", "sametask_past"):
+             raise ValueError(f"context_source must be 'pool', 'pool_sametask', 'pool_past', 'history', 'explore' or 'sametask_past', got {self.context_source!r}")
+         if self.context_source in ("pool_sametask", "pool_past", "history", "explore", "sametask_past") and not self.context_match_viewpoint:
+diff --git a/code/src/lerobot/policies/icwm/modeling_icwm.py b/code/src/lerobot/policies/icwm/modeling_icwm.py
+index 6bc3595..af3b0c4 100755
+--- a/code/src/lerobot/policies/icwm/modeling_icwm.py
++++ b/code/src/lerobot/policies/icwm/modeling_icwm.py
+@@ -202,6 +202,18 @@ class ICWMPolicy(PreTrainedPolicy):
+         self._action_token_str_offset = len(AutoTokenizer.from_pretrained(config.backbone_name_or_path))
+         self._im_end_id = AutoTokenizer.from_pretrained(config.backbone_name_or_path).convert_tokens_to_ids("<|im_end|>")
+ 
++        self.action_expert = None
++        if self._motion_ki():
++            from .action_expert import FlowActionExpert
++
++            text = self.model.config.text_config
++            self.action_expert = FlowActionExpert(
++                vlm_width=text.hidden_size, vlm_layers=text.num_hidden_layers,
++                action_dim=config.output_features[ACTION].shape[0], chunk=config.action_chunk_size,
++                width=config.action_expert_width, depth=config.action_expert_depth, heads=config.action_expert_heads,
++            )
++        self._last_motion_text: list[str] = []
++
+         if config.gradient_checkpointing:
+             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+             # ICWM_GC_SKIP_LAYERS=N: keep the activations of the first N language-model decoder layers instead of
+@@ -224,11 +236,23 @@ class ICWMPolicy(PreTrainedPolicy):
+             self.plucker_head.to(config.device)
+         if getattr(config, "use_camera_tokens", False):
+             self.camera_token_mlp.to(config.device)
++        if self.action_expert is not None:
++            self.action_expert.to(config.device)
+         self.reset()
+ 
+     def reset(self):
+         self._action_queue = deque(maxlen=self.config.n_action_steps)
+ 
++    def _motion(self) -> bool:
++        return bool(getattr(self.config, "motion_reasoning", False))
++
++    def _motion_ki(self) -> bool:
++        return self._motion() and getattr(self.config, "motion_reasoning_mode", "molmoact") == "ki"
++
++    def _is_action_id(self, ids: Tensor) -> Tensor:
++        lo = self._action_token_str_offset
++        return (ids >= lo) & (ids < lo + self.config.action_token_vocab_size)
++
+     def _camera_slot_range(self) -> tuple[int, int]:
+         first = self._action_token_str_offset + self.config.action_token_vocab_size
+         return first, first + self._n_camera_slots()
+@@ -273,6 +297,11 @@ class ICWMPolicy(PreTrainedPolicy):
+             self._camera_rays = None
+ 
+     def get_optim_params(self) -> dict:
++        expert_lr = getattr(self.config, "action_expert_lr", 0.0)
++        if self.action_expert is not None and expert_lr:
++            expert = {id(p) for p in self.action_expert.parameters()}
++            rest = [p for p in self.parameters() if id(p) not in expert]
++            return [{"params": rest}, {"params": list(self.action_expert.parameters()), "lr": expert_lr}]
+         late_lr = getattr(self.config, "plucker_late_lr", 0.0)
+         if self.plucker_late_fusion is None or not late_lr:
+             return self.parameters()
+@@ -297,6 +326,8 @@ class ICWMPolicy(PreTrainedPolicy):
+             return self._forward_inner(batch)
+ 
+     def _forward_inner(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
++        if self._motion():
++            return self._forward_motion(batch)
+         if os.environ.get("ICWM_SPARSE_LOGITS") == "1":
+             return self._forward_sparse_logits(batch)
+         if self.config.plucker_reasoning:
+@@ -369,6 +400,64 @@ class ICWMPolicy(PreTrainedPolicy):
+             )
+         return loss, info
+ 
++    def _forward_motion(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
++        """Motion reasoning (sparse LM head, like _forward_sparse_logits).
++
++        VLM loss = CE(action tokens + closing <|im_end|>) + w * CE(reasoning text), each a mean over its own
++        tokens so the ~50 reasoning tokens do not drown the ~15 action tokens. "ki" adds the flow-matching
++        loss of the action expert, which only sees detached VLM hidden states."""
++        ki = self._motion_ki()
++        out = self.model.model(
++            input_ids=batch["input_ids"],
++            attention_mask=batch["attention_mask"],
++            pixel_values=batch.get("pixel_values"),
++            image_grid_thw=batch.get("image_grid_thw"),
++            use_cache=False,
++            output_hidden_states=ki,
++        )
++        labels = batch["labels"][:, 1:]
++        sup = labels != -100
++        h = out.last_hidden_state[:, :-1][sup]
++        logits = self.model.lm_head(h).float()
++        tgt = labels[sup]
++        is_reason = ~self._is_action_id(tgt) & (tgt != self._im_end_id)
++        if ki and not getattr(self.config, "ki_vlm_fast_loss", True):
++            is_reason = torch.ones_like(is_reason)  # the turn is reasoning + <|im_end|>, no FAST tokens
++        per_tok = F.cross_entropy(logits, tgt, reduction="none")
++        reason_loss = per_tok[is_reason].mean() if is_reason.any() else per_tok.sum() * 0
++        act_loss = per_tok[~is_reason].mean() if (~is_reason).any() else per_tok.sum() * 0
++        loss = act_loss + self.config.motion_reasoning_loss_weight * reason_loss
++        info = {"reasoning_loss": reason_loss.item(), "action_token_loss": act_loss.item()}
++        if ki:
++            key_mask = batch["attention_mask"].bool() & (
++                torch.arange(batch["input_ids"].shape[1], device=batch["input_ids"].device)[None]
++                < batch["reasoning_end"].to(batch["input_ids"].device)[:, None])
++            action_dim = self.config.output_features[ACTION].shape[0]
++            actions = batch[ACTION][..., :action_dim]
++            flow = self.action_expert.loss(actions, out.hidden_states, key_mask, batch.get("action_is_pad"))
++            loss = loss + self.config.action_expert_loss_weight * flow
++            info["flow_loss"] = flow.item()
++        info["loss"] = loss.item()
++        with torch.no_grad():
++            right = logits.argmax(-1) == tgt
++            rows = sup.nonzero(as_tuple=True)[0]
++            n = sup.shape[0]
++
++            def per_row_all(sel):
++                cnt = torch.zeros(n, device=tgt.device).index_add_(0, rows[sel], torch.ones_like(tgt[sel], dtype=torch.float))
++                ok = torch.zeros(n, device=tgt.device).index_add_(0, rows[sel], right[sel].float())
++                return ((ok == cnt) & (cnt > 0)).float().mean().item()
++
++            info.update({
++                "reasoning_token_acc": right[is_reason].float().mean().item() if is_reason.any() else 0.0,
++                "reasoning_exact_acc": per_row_all(is_reason),
++                "token_acc": right[~is_reason].float().mean().item() if (~is_reason).any() else 0.0,
++                "exact_chunk_acc": per_row_all(~is_reason) if (~is_reason).any() else 0.0,
++                "reasoning_tokens": is_reason.sum().item() / n,
++                "seq_len": float(batch["attention_mask"].sum(1).float().mean().item()),
++            })
++        return loss, info
++
+     def _plucker_reasoning_loss(self, batch: dict[str, Tensor], hidden: Tensor) -> tuple[Tensor, dict]:
+         """Regress the query-view Plucker grids from the hidden states at the answer's slot tokens."""
+         targets = batch["plucker_targets"].to(hidden.device).float()
+@@ -429,11 +518,55 @@ class ICWMPolicy(PreTrainedPolicy):
+         max_new_tokens = self.config.max_action_tokens_per_chunk if hasattr(
+             self.config, "max_action_tokens_per_chunk"
+         ) else 32
++        if self._motion():
++            return self._predict_motion(batch, input_ids, attention_mask, max_new_tokens)
+         with self._with_camera(batch):
+             gen_out = self._generate(batch, input_ids, attention_mask, max_new_tokens)
+         new_tokens = gen_out[:, input_ids.shape[1] :]
+         return self._decode_generated(new_tokens, input_ids)
+ 
++    def _predict_motion(self, batch, input_ids, attention_mask, max_action_tokens):
++        """Reason, then act. molmoact: the FAST tokens generated after the reasoning are the action.
++        ki: the reasoning tokens (up to the first action token / <|im_end|>) are appended to the prompt and
++        the action expert integrates the flow from the VLM hidden states of prompt + reasoning."""
++        ki = self._motion_ki()
++        budget = self.config.motion_reasoning_max_tokens
++        if not ki or getattr(self.config, "ki_vlm_fast_loss", True):
++            budget += max_action_tokens
++        gen_out = self._generate(batch, input_ids, attention_mask, budget)
++        new_tokens = gen_out[:, input_ids.shape[1]:]
++        reasoning = []
++        for row in new_tokens.tolist():
++            cut = len(row)
++            for j, t in enumerate(row):
++                if t == self._im_end_id or self._action_token_str_offset <= t < (
++                        self._action_token_str_offset + self.config.action_token_vocab_size):
++                    cut = j
++                    break
++            reasoning.append(row[:cut])
++        from transformers import AutoTokenizer
++
++        if not hasattr(self, "_text_tokenizer"):
++            self._text_tokenizer = AutoTokenizer.from_pretrained(self.config.backbone_name_or_path)
++        self._last_motion_text = [self._text_tokenizer.decode(r) for r in reasoning]
++        if not ki:
++            return self._decode_generated(new_tokens, input_ids)
++        # prompt (left-padded by the processor) + reasoning, right-padded to a common length
++        width = max(len(r) for r in reasoning)
++        pad_id = self._text_tokenizer.pad_token_id or 0
++        ext = torch.full((input_ids.shape[0], width), pad_id, dtype=input_ids.dtype, device=input_ids.device)
++        ext_mask = torch.zeros_like(ext, dtype=attention_mask.dtype)
++        for b, r in enumerate(reasoning):
++            if r:
++                ext[b, :len(r)] = torch.as_tensor(r, dtype=input_ids.dtype, device=input_ids.device)
++                ext_mask[b, :len(r)] = 1
++        ids = torch.cat([input_ids, ext], 1)
++        mask = torch.cat([attention_mask, ext_mask], 1)
++        out = self.model.model(input_ids=ids, attention_mask=mask, pixel_values=batch.get("pixel_values"),
++                               image_grid_thw=batch.get("image_grid_thw"), use_cache=False, output_hidden_states=True)
++        actions = self.action_expert.sample(out.hidden_states, mask.bool(), self.config.flow_num_steps)
++        return actions.to(torch.float32)
++
+     def _generate(self, batch, input_ids, attention_mask, max_new_tokens):
+         return self.model.generate(
+             input_ids=input_ids,
+diff --git a/code/src/lerobot/policies/icwm/motion_reasoning.py b/code/src/lerobot/policies/icwm/motion_reasoning.py
+new file mode 100644
+index 0000000..d6c28c5
+--- /dev/null
++++ b/code/src/lerobot/policies/icwm/motion_reasoning.py
+@@ -0,0 +1,74 @@
++"""Pixel-axis motion reasoning targets.
++
++Question the policy answers before its action: "in THIS camera, which delta-EEF moves the gripper
++X cm along the image's +x (right), +y (down) and +z (away from the camera)?"
++
++The pixel axes are the camera's OpenCV axes: +x = image right (+u), +y = image down (+v),
+++z = optical axis into the scene. Moving along camera +x / +y at constant depth moves the EEF's
++projection purely along +u / +v. The answer is a translation in the robot-base frame (the frame of
++LIBERO's delta-EEF actions); rotation and gripper deltas are zero and left out.
++
++It depends only on the camera rotation, so it is the same for every frame of a viewpoint: the model
++has to read the viewpoint off the interaction context (and the current image) to get it right.
++
++Units (``motion_reasoning_units``):
++  * "context_step": raw action units per step, spread over one context clip (``horizon`` steps).
++  * "chunk_step":   raw action units per step, spread over one predicted action chunk
++                    (``action_chunk_size`` steps). With ICWM's context horizon == action_chunk_size
++                    this is numerically identical to "context_step".
++  * "total":        raw action units summed over the whole move (sum of per-step actions).
++  * "cm":           the metric translation itself, in cm (LAP-style language numbers).
++Raw action -> metres uses a per-axis gain (m per action unit per step) measured on the training data
++(least squares of the EEF displacement over 5 steps on the summed actions).
++"""
++from __future__ import annotations
++
++import re
++
++import torch
++
++AXES = ("x", "y", "z")
++UNITS = ("context_step", "chunk_step", "total", "cm")
++# OpenGL camera axes (x right, y up, looking down -z) -> pixel/OpenCV axes (x right, y down, z forward)
++_GL_TO_PIXEL = torch.diag(torch.tensor([1.0, -1.0, -1.0], dtype=torch.float64))
++
++
++def pixel_axes_in_base(camera_to_world: torch.Tensor, base_to_world: torch.Tensor | None = None) -> torch.Tensor:
++    """(3, 3) matrix whose ROWS are the image +x, +y, +z directions expressed in the base frame."""
++    R = camera_to_world[:3, :3].to(torch.float64) @ _GL_TO_PIXEL
++    if base_to_world is not None:
++        R = base_to_world[:3, :3].to(torch.float64).T @ R
++    return R.T
++
++
++def motion_targets(camera_to_world, base_to_world, cm: float, units: str, gain, horizon: int) -> torch.Tensor:
++    """(3 axes, 3 components) delta-EEF for an X-cm move along each pixel axis, in `units`."""
++    d = pixel_axes_in_base(camera_to_world, base_to_world) * (cm / 100.0)  # metres, rows = pixel axes
++    if units == "cm":
++        return (d * 100.0).float()
++    a = d / torch.as_tensor(gain, dtype=torch.float64)[None]  # total raw action units
++    if units == "total":
++        return a.float()
++    if units in ("context_step", "chunk_step"):
++        return (a / horizon).float()
++    raise ValueError(f"unknown motion_reasoning_units {units!r}; expected one of {UNITS}")
++
++
++def format_motion(values: torch.Tensor, decimals: int) -> str:
++    """'x:+0.92,+0.01,-0.10;y:...;z:...;' -- signs always written so every number tokenizes the same way."""
++    rows = []
++    for name, row in zip(AXES, values.tolist(), strict=True):
++        rows.append(f"{name}:" + ",".join(f"{v:+.{decimals}f}" for v in row))
++    return ";".join(rows) + ";"
++
++
++_NUM = r"([+-]\d+(?:\.\d+)?)"
++_ROW = re.compile(rf"([xyz]):{_NUM},{_NUM},{_NUM}")
++
++
++def parse_motion(text: str) -> torch.Tensor | None:
++    """Inverse of format_motion; None when an axis is missing or malformed."""
++    found = {m.group(1): [float(m.group(i)) for i in (2, 3, 4)] for m in _ROW.finditer(text)}
++    if set(found) != set(AXES):
++        return None
++    return torch.tensor([found[a] for a in AXES])
+diff --git a/code/src/lerobot/policies/icwm/processor_icwm.py b/code/src/lerobot/policies/icwm/processor_icwm.py
+index 658a1f6..e9c40fe 100755
+--- a/code/src/lerobot/policies/icwm/processor_icwm.py
++++ b/code/src/lerobot/policies/icwm/processor_icwm.py
+@@ -132,6 +132,14 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+     plucker_reasoning_grid: int = 4
+     use_camera_tokens: bool = False
+     camera_token_grid: int = 4
++    motion_reasoning: bool = False
++    motion_reasoning_cm: float = 5.0
++    motion_reasoning_units: str = "chunk_step"
++    motion_reasoning_gain: tuple[float, float, float] | list[float] = (0.01092, 0.01245, 0.01072)
++    motion_reasoning_decimals: int = 2
++    motion_reasoning_horizon: int = 5  # context-clip horizon == action_chunk_size
++    # False: the assistant turn is the reasoning only (KI with ki_vlm_fast_loss=False)
++    motion_reasoning_with_fast: bool = True
+     input_features: dict[str, PolicyFeature] | dict[str, dict[str, Any]] = field(default_factory=dict)
+ 
+     _processor: "Qwen2_5_VLProcessor | None" = field(default=None, init=False, repr=False)
+@@ -283,6 +291,11 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+         if action is not None:
+             action = action.detach().cpu()
+ 
++        motion_texts = None
++        if self.motion_reasoning and action is not None:
++            motion_texts, motion_values = self._motion_targets(observation, bsize)
++            complementary_data["motion_targets"] = motion_values
++
+         messages = []
+         target_lens = []
+         for b in range(bsize):
+@@ -316,6 +329,10 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+ 
+             if action is not None:
+                 target_text, target_len = self._encode_action_chunk(action[b])
++                if motion_texts is not None:
++                    if not self.motion_reasoning_with_fast:
++                        target_text, target_len = "", 0
++                    target_text = motion_texts[b] + target_text
+                 sample_messages.append(
+                     {"role": "assistant", "content": [{"type": "text", "text": self._plucker_slot_text + target_text}]}
+                 )
+@@ -403,6 +420,7 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+             header = len(tok("assistant\n", add_special_tokens=False)["input_ids"]) + 1  # <|im_start|> + "assistant\n"
+             is_action_tok = torch.isin(input_ids, self._action_token_ids)
+             labels = torch.full_like(input_ids, -100)
++            reasoning_end = torch.zeros(bsize, dtype=torch.long)
+             for b in range(bsize):
+                 row = input_ids[b]
+                 starts = (row == im_start).nonzero().flatten()
+@@ -411,6 +429,11 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+                 turn_end = turn_start + int(ends[0]) if len(ends) else int(inputs["attention_mask"][b].sum())
+                 mask = torch.zeros_like(row, dtype=torch.bool)
+                 mask[turn_start:turn_end] = is_action_tok[b, turn_start:turn_end]
++                if motion_texts is not None:
++                    # the reasoning text = every token of the turn before its first action token; supervised too
++                    acts = is_action_tok[b, turn_start:turn_end].nonzero().flatten()
++                    reasoning_end[b] = turn_start + int(acts[0]) if len(acts) else turn_end
++                    mask[turn_start:int(reasoning_end[b])] = True
+                 if turn_end < row.shape[0] and row[turn_end] == im_end:
+                     mask[turn_end] = True  # learn to stop after the chunk
+                 n_act = int(is_action_tok[b, turn_start:turn_end].sum())
+@@ -418,9 +441,30 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+                     raise RuntimeError(f"assistant turn has {n_act} action tokens, expected {target_lens[b]}")
+                 labels[b, mask] = row[mask]
+             complementary_data["labels"] = labels
++            if motion_texts is not None:
++                # exclusive end of the action expert's keys (prefix + reasoning, never the FAST tokens)
++                complementary_data["reasoning_end"] = reasoning_end
+ 
+         return complementary_data
+ 
++    def _motion_targets(self, observation, bsize):
++        """Pixel-axis motion answer of every row, from the query (first) camera's calibration."""
++        from .motion_reasoning import format_motion, motion_targets
++        from .plucker import ROBOT_BASE_KEY, camera_keys
++
++        _, pose_key = camera_keys(self._image_keys[0])
++        if pose_key not in observation:
++            raise ValueError(f"motion_reasoning needs {pose_key} (plucker_calibration_dir) at training")
++        poses = observation[pose_key].detach().cpu().reshape(bsize, 4, 4)
++        base = observation.get(ROBOT_BASE_KEY)
++        base = None if base is None else base.detach().cpu().reshape(bsize, 4, 4)
++        values = torch.stack([
++            motion_targets(poses[b], None if base is None else base[b], self.motion_reasoning_cm,
++                           self.motion_reasoning_units, self.motion_reasoning_gain, self.motion_reasoning_horizon)
++            for b in range(bsize)
++        ])
++        return [format_motion(v, self.motion_reasoning_decimals) for v in values], values
++
+     def get_config(self) -> dict[str, Any]:
+         return {
+             "backbone_name_or_path": self.backbone_name_or_path,
+@@ -438,6 +482,13 @@ class ICWMSequenceBuilderStep(ComplementaryDataProcessorStep):
+             "plucker_reasoning_grid": self.plucker_reasoning_grid,
+             "use_camera_tokens": self.use_camera_tokens,
+             "camera_token_grid": self.camera_token_grid,
++            "motion_reasoning": self.motion_reasoning,
++            "motion_reasoning_cm": self.motion_reasoning_cm,
++            "motion_reasoning_units": self.motion_reasoning_units,
++            "motion_reasoning_gain": list(self.motion_reasoning_gain),
++            "motion_reasoning_decimals": self.motion_reasoning_decimals,
++            "motion_reasoning_horizon": self.motion_reasoning_horizon,
++            "motion_reasoning_with_fast": self.motion_reasoning_with_fast,
+             "input_features": {
+                 key: {"type": ft.type.value, "shape": ft.shape} for key, ft in self.input_features.items()
+             },
+@@ -500,6 +551,14 @@ def make_icwm_pre_post_processors(
+             plucker_reasoning_grid=config.plucker_reasoning_grid,
+             use_camera_tokens=getattr(config, "use_camera_tokens", False),
+             camera_token_grid=getattr(config, "camera_token_grid", 4),
++            motion_reasoning=getattr(config, "motion_reasoning", False),
++            motion_reasoning_cm=getattr(config, "motion_reasoning_cm", 5.0),
++            motion_reasoning_units=getattr(config, "motion_reasoning_units", "chunk_step"),
++            motion_reasoning_gain=tuple(getattr(config, "motion_reasoning_gain", (0.01092, 0.01245, 0.01072))),
++            motion_reasoning_decimals=getattr(config, "motion_reasoning_decimals", 2),
++            motion_reasoning_horizon=config.action_chunk_size,
++            motion_reasoning_with_fast=not (getattr(config, "motion_reasoning_mode", "molmoact") == "ki"
++                                            and not getattr(config, "ki_vlm_fast_loss", True)),
+             input_features=config.input_features,
+         ),
+         DeviceProcessorStep(device=config.device),
